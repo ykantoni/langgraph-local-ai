@@ -1,0 +1,92 @@
+https://airflow.apache.org/
+
+https://trevor.io/blog/apache-superset-alternatives
+
+https://redash.io/
+
+*** https://airflow.apache.org/docs/helm-chart/stable/index.html
+
+*** https://airflow.apache.org/docs/apache-airflow/1.10.9/concepts.html#:~:text=In%20Airflow%2C%20a%20DAG%20%E2%80%93%20or,and%20their%20dependencies)%20as%20code.
+
+[root@pt-swcl025-vm ~]# helm repo add apache-airflow https://airflow.apache.org
+"apache-airflow" has been added to your repositories
+[root@pt-swcl025-vm ~]#
+
+[root@pt-swcl025-vm ~]# helm upgrade --install airflow apache-airflow/airflow --namespace default
+Release "airflow" does not exist. Installing it now.
+NAME: airflow
+LAST DEPLOYED: Sun Nov  5 21:17:13 2023
+NAMESPACE: default
+STATUS: deployed
+REVISION: 1
+TEST SUITE: None
+NOTES:
+Thank you for installing Apache Airflow 2.7.1!
+
+Your release is named airflow.
+You can now access your dashboard(s) by executing the following command(s) and visiting the corresponding port at localhost in your browser:
+
+Airflow Webserver:     kubectl port-forward svc/airflow-webserver 8080:8080 --namespace default
+Default Webserver (Airflow UI) Login credentials:
+    username: admin
+    password: admin
+Default Postgres connection credentials:
+    username: postgres
+    password: postgres
+    port: 5432
+
+You can get Fernet Key value by running the following:
+
+    echo Fernet Key: $(kubectl get secret --namespace default airflow-fernet-key -o jsonpath="{.data.fernet-key}" | base64 --decode)
+
+###########################################################
+#  WARNING: You should set a static webserver secret key  #
+###########################################################
+
+You are using a dynamically generated webserver secret key, which can lead to
+unnecessary restarts of your Airflow components.
+
+Information on how to set a static webserver secret key can be found here:
+https://airflow.apache.org/docs/helm-chart/stable/production-guide.html#webserver-secret-key
+[root@pt-swcl025-vm ~]#
+
+[root@pt-swcl025-vm ~]# k get svc
+NAME                       TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)             AGE
+airflow-postgresql         ClusterIP   1.9.190.63     <none>        5432/TCP            3m33s
+airflow-postgresql-hl      ClusterIP   None           <none>        5432/TCP            3m33s
+airflow-redis              ClusterIP   1.1.87.18      <none>        6379/TCP            3m33s
+airflow-statsd             ClusterIP   1.1.255.15     <none>        9125/UDP,9102/TCP   3m33s
+airflow-triggerer          ClusterIP   None           <none>        8794/TCP            3m33s
+airflow-webserver          ClusterIP   1.10.229.130   <none>        8080/TCP            3m33s
+airflow-worker             ClusterIP   None           <none>        8793/TCP            3m33s
+kubernetes                 ClusterIP   1.0.0.1        <none>        443/TCP             47h
+ohopostgresql              NodePort    1.2.177.25     <none>        5432:30593/TCP      103m
+ohosuperset                NodePort    1.4.5.58       <none>        8088:30523/TCP      11h
+private-iprepository-k8s   NodePort    1.6.53.162     <none>        5000:31321/TCP      37h
+superset                   ClusterIP   1.1.115.28     <none>        8088/TCP            3h17m
+superset-postgresql        ClusterIP   1.15.47.22     <none>        5432/TCP            3h17m
+superset-postgresql-hl     ClusterIP   None           <none>        5432/TCP            3h17m
+superset-redis-headless    ClusterIP   None           <none>        6379/TCP            3h17m
+superset-redis-master      ClusterIP   1.11.75.20     <none>        6379/TCP            3h17m
+[root@pt-swcl025-vm ~]# kubectl expose service/airflow-webserver --type="NodePort" --port 8080 --name=ohoairflow
+service/ohoairflow exposed
+[root@pt-swcl025-vm ~]# k get svc
+NAME                       TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)             AGE
+airflow-postgresql         ClusterIP   1.9.190.63     <none>        5432/TCP            4m58s
+airflow-postgresql-hl      ClusterIP   None           <none>        5432/TCP            4m58s
+airflow-redis              ClusterIP   1.1.87.18      <none>        6379/TCP            4m58s
+airflow-statsd             ClusterIP   1.1.255.15     <none>        9125/UDP,9102/TCP   4m58s
+airflow-triggerer          ClusterIP   None           <none>        8794/TCP            4m58s
+airflow-webserver          ClusterIP   1.10.229.130   <none>        8080/TCP            4m58s
+airflow-worker             ClusterIP   None           <none>        8793/TCP            4m58s
+kubernetes                 ClusterIP   1.0.0.1        <none>        443/TCP             47h
+ohoairflow                 NodePort    1.0.24.0       <none>        8080:31659/TCP      4s
+ohopostgresql              NodePort    1.2.177.25     <none>        5432:30593/TCP      104m
+ohosuperset                NodePort    1.4.5.58       <none>        8088:30523/TCP      11h
+private-iprepository-k8s   NodePort    1.6.53.162     <none>        5000:31321/TCP      37h
+superset                   ClusterIP   1.1.115.28     <none>        8088/TCP            3h19m
+superset-postgresql        ClusterIP   1.15.47.22     <none>        5432/TCP            3h19m
+superset-postgresql-hl     ClusterIP   None           <none>        5432/TCP            3h19m
+superset-redis-headless    ClusterIP   None           <none>        6379/TCP            3h19m
+superset-redis-master      ClusterIP   1.11.75.20     <none>        6379/TCP            3h19m
+[root@pt-swcl025-vm ~]#

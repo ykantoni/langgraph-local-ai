@@ -16,6 +16,13 @@ Set your OpenAI key:
 $env:OPENAI_API_KEY="your_key_here"
 ```
 
+Or set it programmatically for this script by providing `OPENAI_API_KEY_VALUE`
+(the script copies it to `OPENAI_API_KEY` at startup):
+
+```powershell
+$env:OPENAI_API_KEY_VALUE="your_key_here"
+```
+
 ## Run
 
 ```powershell
