@@ -1,5 +1,6 @@
 import os
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List
 
@@ -104,35 +105,74 @@ def split_and_sanitize_documents(docs: list[Document]) -> list[Document]:
         safe_chunks.append(Document(page_content=text, metadata=chunk.metadata))
 
     if dropped:
-        print(f"Dropped {dropped} empty chunks before embedding")
+        logger.warning("Dropped %d empty chunks before embedding", dropped)
     if not safe_chunks:
         raise ValueError("No valid chunks after splitting/sanitization")
     return safe_chunks
 
 
 def build_faiss_batched(chunks: list[Document], embeddings: OllamaCleanEmbeddings) -> FAISS:
-    """Build FAISS in batches to reduce pressure on local embedding server."""
-    batch_size = int(os.environ.get("EMBED_BATCH_SIZE", "256"))
-    first = chunks[:batch_size]
-    if not first:
+    """Embed batches in parallel threads, then build FAISS index from pre-computed vectors.
+
+    Ollama server handles each /api/embed request independently, so parallel calls
+    are safe. FAISS index construction is kept sequential (not thread-safe for writes).
+    """
+    if not chunks:
         raise ValueError("Cannot build vector index from empty chunk list")
 
-    total_chunks = len(chunks)
-    total_batches = (total_chunks + batch_size - 1) // batch_size
-    logger.info(
-        "Creating embeddings/index for %d chunks in %d batches (batch_size=%d)",
-        total_chunks,
-        total_batches,
-        batch_size,
-    )
-    logger.info("Embedding batch 1/%d (%d chunks)", total_batches, len(first))
-    vectorstore = FAISS.from_documents(first, embeddings)
-    for batch_num, start in enumerate(range(batch_size, len(chunks), batch_size), start=2):
-        batch = chunks[start : start + batch_size]
-        logger.info("Embedding batch %d/%d (%d chunks)", batch_num, total_batches, len(batch))
-        vectorstore.add_documents(batch)
+    batch_size = int(os.environ.get("EMBED_BATCH_SIZE", "256"))
+    num_threads = int(os.environ.get("EMBED_THREADS", "8"))
 
-    logger.info("Vector index build complete")
+    batches = [chunks[i : i + batch_size] for i in range(0, len(chunks), batch_size)]
+    total_batches = len(batches)
+    logger.info(
+        "Embedding %d chunks in %d batches | batch_size=%d  threads=%d",
+        len(chunks), total_batches, batch_size, num_threads,
+    )
+
+    def embed_batch(idx: int, batch: list[Document]):
+        texts = [doc.page_content for doc in batch]
+        sizes = [len(t) for t in texts]
+        total_chars = sum(sizes)
+        avg_chars = total_chars // len(sizes) if sizes else 0
+        min_chars = min(sizes) if sizes else 0
+        max_chars = max(sizes) if sizes else 0
+        logger.info(
+            "  Batch %d/%d started  | chunks=%d  total=%d chars  avg=%d  min=%d  max=%d",
+            idx + 1, total_batches, len(texts), total_chars, avg_chars, min_chars, max_chars,
+        )
+        vectors = embeddings.embed_documents(texts)
+        logger.info(
+            "  Batch %d/%d finished | vectors=%d  total=%d chars embedded",
+            idx + 1, total_batches, len(vectors), total_chars,
+        )
+        return idx, vectors
+
+    # --- parallel embedding phase ---
+    # OLLAMA_NUM_PARALLEL=8
+    # seems does not work for embeddings
+    #
+    results: dict[int, list[list[float]]] = {}
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        futures = {executor.submit(embed_batch, i, batch): i for i, batch in enumerate(batches)}
+        for future in as_completed(futures):
+            idx, vectors = future.result()
+            results[idx] = vectors
+
+    # --- sequential FAISS build phase (not thread-safe) ---
+    all_texts = [doc.page_content for doc in chunks]
+    all_metas = [doc.metadata for doc in chunks]
+    all_vectors: list[list[float]] = []
+    for i in range(total_batches):
+        all_vectors.extend(results[i])
+
+    logger.info("Building FAISS index from %d vectors ...", len(all_vectors))
+    vectorstore = FAISS.from_embeddings(
+        text_embeddings=list(zip(all_texts, all_vectors)),
+        embedding=embeddings,
+        metadatas=all_metas,
+    )
+    logger.info("Vector index build complete  (%d vectors indexed)", len(all_vectors))
     return vectorstore
 
 # 1. Load local documents
@@ -146,7 +186,9 @@ logger.info("Prepared %d chunks for embedding", len(chunks))
 # 3. Create vector index (FAISS)
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_CHAT_MODEL = os.environ.get("OLLAMA_CHAT_MODEL", "granite3.3")
-OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "mxbai-embed-large")
+# mxbai-embed-large
+# nomic-embed-text
 
 embeddings = OllamaCleanEmbeddings(model=OLLAMA_EMBED_MODEL, base_url=OLLAMA_BASE_URL)
 vectorstore = build_faiss_batched(chunks, embeddings)
