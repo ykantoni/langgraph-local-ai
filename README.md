@@ -1,6 +1,6 @@
 # Local docs LangChain agent
 
-This project runs a CLI agent that answers questions using local `.txt` files under `./docs`.
+This project runs a CLI agent that answers questions using local `.txt` files under `./docs`, powered by a local Ollama server.
 
 ## Setup
 
@@ -10,22 +10,25 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
-Set your OpenAI key:
+Start Ollama and pull models:
 
 ```powershell
-$env:OPENAI_API_KEY="your_key_here"
-```
-
-Or set it programmatically for this script by providing `OPENAI_API_KEY_VALUE`
-(the script copies it to `OPENAI_API_KEY` at startup):
-
-```powershell
-$env:OPENAI_API_KEY_VALUE="your_key_here"
+$env:OLLAMA_BASE_URL="http://localhost:11434"
+ollama pull granite3.3
+ollama pull nomic-embed-text
 ```
 
 ## Run
 
 ```powershell
+python .\agent.py
+```
+
+Optional model overrides:
+
+```powershell
+$env:OLLAMA_CHAT_MODEL="granite3.3"
+$env:OLLAMA_EMBED_MODEL="nomic-embed-text"
 python .\agent.py
 ```
 
