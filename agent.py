@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List
 
-import ollama as _ollama
+from sentence_transformers import SentenceTransformer
 from langchain_classic.agents import AgentType, initialize_agent
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
@@ -21,24 +21,62 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class OllamaCleanEmbeddings(Embeddings):
-    """Calls Ollama /api/embed directly — no LLM sampling options attached.
+class SentenceTransformerEmbeddings(Embeddings):
+    """Local embedding via sentence-transformers — in-process, no HTTP, GPU-aware.
 
-    This avoids the 'invalid option: tfs_z' error that langchain_ollama's
-    OllamaEmbeddings triggers on pure embedding models like nomic-embed-text.
+    For retrieval-optimised models (e.g. mxbai-embed-large-v1) a query prefix is
+    prepended automatically on embed_query() while documents are embedded as-is.
     """
 
-    def __init__(self, model: str, base_url: str = "http://localhost:11434") -> None:
-        self.model = model
-        self._client = _ollama.Client(host=base_url)
+    # Used by mxbai-embed-large-v1 and compatible models; ignored for others.
+    _QUERY_PROMPT = "Represent this sentence for searching relevant passages: "
+
+    def __init__(
+        self,
+        model_name: str = "BAAI/bge-small-en-v1.5",
+        device: str | None = None,
+        normalize: bool = True,
+        encode_batch_size: int = 32,
+    ) -> None:
+        import torch
+
+        self._model_name = model_name
+        self._normalize = normalize
+        self._encode_batch_size = encode_batch_size
+
+        requested_device = (device or "auto").lower()
+        if requested_device == "auto":
+            resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
+        elif requested_device == "cuda" and not torch.cuda.is_available():
+            logger.warning(
+                "ST_DEVICE=cuda requested, but CUDA is unavailable in this PyTorch build. Falling back to CPU."
+            )
+            resolved_device = "cpu"
+        else:
+            resolved_device = requested_device
+
+        self._device = resolved_device
+        logger.info("Loading SentenceTransformer '%s' on %s ...", model_name, self._device)
+        self._model = SentenceTransformer(model_name, device=self._device)
+        logger.info("SentenceTransformer model ready")
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        response = self._client.embed(model=self.model, input=texts)
-        return [list(vector) for vector in response.embeddings]
+        vectors = self._model.encode(
+            texts,
+            batch_size=self._encode_batch_size,
+            normalize_embeddings=self._normalize,
+            show_progress_bar=False,
+        )
+        return [v.tolist() for v in vectors]
 
     def embed_query(self, text: str) -> List[float]:
-        response = self._client.embed(model=self.model, input=[text])
-        return list(response.embeddings[0])
+        prompted = self._QUERY_PROMPT + text
+        vector = self._model.encode(
+            [prompted],
+            normalize_embeddings=self._normalize,
+            show_progress_bar=False,
+        )
+        return vector[0].tolist()
 
 
 def load_documents(docs_dir: str):
@@ -111,7 +149,7 @@ def split_and_sanitize_documents(docs: list[Document]) -> list[Document]:
     return safe_chunks
 
 
-def build_faiss_batched(chunks: list[Document], embeddings: OllamaCleanEmbeddings) -> FAISS:
+def build_faiss_batched(chunks: list[Document], embeddings: SentenceTransformerEmbeddings) -> FAISS:
     """Embed batches in parallel threads, then build FAISS index from pre-computed vectors.
 
     Ollama server handles each /api/embed request independently, so parallel calls
@@ -120,7 +158,7 @@ def build_faiss_batched(chunks: list[Document], embeddings: OllamaCleanEmbedding
     if not chunks:
         raise ValueError("Cannot build vector index from empty chunk list")
 
-    batch_size = int(os.environ.get("EMBED_BATCH_SIZE", "256"))
+    batch_size = int(os.environ.get("EMBED_BATCH_SIZE", "32"))
     num_threads = int(os.environ.get("EMBED_THREADS", "8"))
 
     batches = [chunks[i : i + batch_size] for i in range(0, len(chunks), batch_size)]
@@ -186,11 +224,18 @@ logger.info("Prepared %d chunks for embedding", len(chunks))
 # 3. Create vector index (FAISS)
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_CHAT_MODEL = os.environ.get("OLLAMA_CHAT_MODEL", "granite3.3")
-OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "mxbai-embed-large")
-# mxbai-embed-large
-# nomic-embed-text
+# sentence-transformers model (downloaded from HuggingFace on first run)
+# mxbai-embed-large-v1  → 335M params, 1024-dim, strong retrieval quality
+# nomic-ai/nomic-embed-text-v1  → 137M params, 768-dim, lighter alternative
+ST_EMBED_MODEL = os.environ.get("ST_EMBED_MODEL", "sentence-transformers/static-retrieval-mrl-en-v1")
+ST_ENCODE_BATCH = int(os.environ.get("ST_ENCODE_BATCH", "32"))
+ST_DEVICE = os.environ.get("ST_DEVICE", "cpu")
 
-embeddings = OllamaCleanEmbeddings(model=OLLAMA_EMBED_MODEL, base_url=OLLAMA_BASE_URL)
+embeddings = SentenceTransformerEmbeddings(
+    model_name=ST_EMBED_MODEL,
+    encode_batch_size=ST_ENCODE_BATCH,
+    device=ST_DEVICE,
+)
 vectorstore = build_faiss_batched(chunks, embeddings)
 
 # 4. Create a search function
