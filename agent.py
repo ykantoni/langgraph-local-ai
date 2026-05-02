@@ -1,12 +1,13 @@
 import os
 import logging
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List
 
 from sentence_transformers import SentenceTransformer
 from langchain_classic.agents import AgentType, initialize_agent
-from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores import FAISS 
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.tools import Tool
@@ -20,7 +21,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
+# https://huggingface.co/blog/static-embeddings
 class SentenceTransformerEmbeddings(Embeddings):
     """Local embedding via sentence-transformers — in-process, no HTTP, GPU-aware.
 
@@ -213,15 +214,89 @@ def build_faiss_batched(chunks: list[Document], embeddings: SentenceTransformerE
     logger.info("Vector index build complete  (%d vectors indexed)", len(all_vectors))
     return vectorstore
 
-# 1. Load local documents
-DOCS_DIR = os.environ.get("DOCS_DIR", "/docs")
-docs = load_documents(DOCS_DIR)
 
-# 2. Split into chunks
-chunks = split_and_sanitize_documents(docs)
-logger.info("Prepared %d chunks for embedding", len(chunks))
+def collect_docs_state(docs_dir: str) -> dict:
+    """Collect lightweight source state using file size + mtime_ns for .txt files."""
+    docs_path = Path(docs_dir)
+    txt_files = sorted([p for p in docs_path.iterdir() if p.is_file() and p.suffix == ".txt"])
 
-# 3. Create vector index (FAISS)
+    files: dict[str, dict[str, int]] = {}
+    for path in txt_files:
+        stat = path.stat()
+        files[str(path.resolve())] = {
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+
+    return {
+        "docs_dir": str(docs_path.resolve()),
+        "file_count": len(files),
+        "files": files,
+    }
+
+
+def load_saved_docs_state(state_file: str) -> dict | None:
+    if not os.path.exists(state_file):
+        return None
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        logger.warning("Failed to read docs state file, forcing rebuild: %s", state_file)
+        return None
+
+
+def save_docs_state(state_file: str, state: dict) -> None:
+    with open(state_file, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+
+
+def docs_changed(docs_dir: str, state_file: str) -> bool:
+    """Return True when current docs metadata differs from the saved metadata."""
+    current = collect_docs_state(docs_dir)
+    saved = load_saved_docs_state(state_file)
+    return saved != current
+
+
+def get_or_create_vectorstore(embeddings: SentenceTransformerEmbeddings) -> FAISS:
+    """Load FAISS index from disk when available, else build and persist it."""
+    force_rebuild = os.environ.get("FORCE_REBUILD_INDEX", "0") == "1"
+
+    has_index_files = os.path.exists(FAISS_INDEX_FILE) and os.path.exists(FAISS_META_FILE)
+    source_changed = docs_changed(DOCS_DIR, FAISS_STATE_FILE)
+
+    if not force_rebuild and has_index_files and not source_changed:
+        logger.info("Loading FAISS index from disk: %s", FAISS_INDEX_DIR)
+        vectorstore = FAISS.load_local(
+            folder_path=FAISS_INDEX_DIR,
+            embeddings=embeddings,
+            index_name=FAISS_INDEX_NAME,
+            allow_dangerous_deserialization=True,
+        )
+        logger.info("Loaded FAISS index successfully (docs unchanged)")
+        return vectorstore
+
+    if force_rebuild:
+        logger.info("FORCE_REBUILD_INDEX=1 set, rebuilding FAISS index")
+    elif not has_index_files:
+        logger.info("No persisted FAISS index found, creating a new one")
+    elif source_changed:
+        logger.info("Source documents changed, rebuilding FAISS index")
+    else:
+        logger.info("Rebuilding FAISS index")
+
+    docs = load_documents(DOCS_DIR)
+    chunks = split_and_sanitize_documents(docs)
+    logger.info("Prepared %d chunks for embedding", len(chunks))
+
+    vectorstore = build_faiss_batched(chunks, embeddings)
+    os.makedirs(FAISS_INDEX_DIR, exist_ok=True)
+    vectorstore.save_local(folder_path=FAISS_INDEX_DIR, index_name=FAISS_INDEX_NAME)
+    save_docs_state(FAISS_STATE_FILE, collect_docs_state(DOCS_DIR))
+    logger.info("Saved FAISS index to disk: %s", FAISS_INDEX_DIR)
+    return vectorstore
+
+# 1. Vector/Model configuration
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_CHAT_MODEL = os.environ.get("OLLAMA_CHAT_MODEL", "granite3.3")
 # sentence-transformers model (downloaded from HuggingFace on first run)
@@ -230,13 +305,19 @@ OLLAMA_CHAT_MODEL = os.environ.get("OLLAMA_CHAT_MODEL", "granite3.3")
 ST_EMBED_MODEL = os.environ.get("ST_EMBED_MODEL", "sentence-transformers/static-retrieval-mrl-en-v1")
 ST_ENCODE_BATCH = int(os.environ.get("ST_ENCODE_BATCH", "32"))
 ST_DEVICE = os.environ.get("ST_DEVICE", "cpu")
+DOCS_DIR = os.environ.get("DOCS_DIR", "/docs")
+FAISS_INDEX_DIR = os.environ.get("FAISS_INDEX_DIR", "./faiss_store")
+FAISS_INDEX_NAME = os.environ.get("FAISS_INDEX_NAME", "index")
+FAISS_INDEX_FILE = os.path.join(FAISS_INDEX_DIR, f"{FAISS_INDEX_NAME}.faiss")
+FAISS_META_FILE = os.path.join(FAISS_INDEX_DIR, f"{FAISS_INDEX_NAME}.pkl")
+FAISS_STATE_FILE = os.path.join(FAISS_INDEX_DIR, f"{FAISS_INDEX_NAME}.source_state.json")
 
 embeddings = SentenceTransformerEmbeddings(
     model_name=ST_EMBED_MODEL,
     encode_batch_size=ST_ENCODE_BATCH,
     device=ST_DEVICE,
 )
-vectorstore = build_faiss_batched(chunks, embeddings)
+vectorstore = get_or_create_vectorstore(embeddings)
 
 # 4. Create a search function
 def search_docs(query: str) -> str:
