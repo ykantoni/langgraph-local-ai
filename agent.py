@@ -1,10 +1,17 @@
 import os
 import logging
 import json
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List
 
+import pypdf
+import docx as _docx
+try:
+    import fitz  # PyMuPDF (much faster text extraction for many large PDFs)
+except Exception:
+    fitz = None
 from sentence_transformers import SentenceTransformer
 from langchain_classic.agents import AgentType, initialize_agent
 from langchain_community.vectorstores import FAISS 
@@ -80,43 +87,106 @@ class SentenceTransformerEmbeddings(Embeddings):
         return vector[0].tolist()
 
 
+SUPPORTED_EXTENSIONS = {".txt", ".pdf", ".docx"}
+
+
+def _load_txt(file_path: str) -> str:
+    """Load a plain-text file with multi-encoding fallback."""
+    encodings_to_try = ["utf-8", "cp1252", "latin-1", "ascii"]
+    for encoding in encodings_to_try:
+        try:
+            with open(file_path, encoding=encoding) as f:
+                return f.read()
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    raise RuntimeError(f"Could not decode {file_path} with any of {encodings_to_try}")
+
+
+def _load_pdf(file_path: str) -> str:
+    """Extract text from a PDF with fast backend + lightweight cache."""
+    path = Path(file_path)
+    max_pages = int(os.environ.get("PDF_MAX_PAGES", "0"))
+    extractor = os.environ.get("PDF_EXTRACTOR", "auto").lower()
+    cache_dir = Path(os.environ.get("PDF_CACHE_DIR", "./.pdf_text_cache"))
+
+    stat = path.stat()
+    cache_key_raw = f"{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|{max_pages}|{extractor}"
+    cache_key = hashlib.sha256(cache_key_raw.encode("utf-8")).hexdigest()
+    cache_file = cache_dir / f"{cache_key}.txt"
+
+    if cache_file.exists():
+        return cache_file.read_text(encoding="utf-8")
+
+    # Prefer PyMuPDF when present; fallback to pypdf.
+    if extractor in {"auto", "pymupdf"} and fitz is not None:
+        with fitz.open(file_path) as doc:
+            pages: list[str] = []
+            page_count = len(doc)
+            limit = page_count if max_pages <= 0 else min(max_pages, page_count)
+            for i in range(limit):
+                pages.append(doc[i].get_text("text") or "")
+            text = "\n".join(pages)
+    else:
+        reader = pypdf.PdfReader(file_path)
+        pages: list[str] = []
+        page_count = len(reader.pages)
+        limit = page_count if max_pages <= 0 else min(max_pages, page_count)
+        for i in range(limit):
+            pages.append(reader.pages[i].extract_text() or "")
+        text = "\n".join(pages)
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file.write_text(text, encoding="utf-8")
+    return text
+
+
+def _load_docx(file_path: str) -> str:
+    """Extract paragraph text from a DOCX file."""
+    doc = _docx.Document(file_path)
+    return "\n".join(para.text for para in doc.paragraphs)
+
+
 def load_documents(docs_dir: str):
-    """Load documents with fallback encoding handling."""
+    """Load .txt, .pdf, and .docx documents with fallback encoding for text files."""
     docs_path = Path(docs_dir)
     if not docs_path.exists():
         raise FileNotFoundError(f"Docs directory not found: {docs_path.resolve()}")
 
-    docs = []
-    # Try encodings in order: UTF-8, Windows-1252 (common on Windows), Latin-1, ASCII
-    encodings_to_try = ["utf-8", "cp1252", "latin-1", "ascii"]
-    
-    txt_files = [name for name in os.listdir(docs_path) if name.endswith(".txt")]
-    logger.info("Scanning %d .txt files in %s", len(txt_files), docs_path.resolve())
+    source_files = sorted([
+        p for p in docs_path.iterdir()
+        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+    ])
+    logger.info(
+        "Scanning %d supported files (.txt/.pdf/.docx) in %s",
+        len(source_files), docs_path.resolve(),
+    )
 
-    for index, file in enumerate(txt_files, start=1):
-        if file.endswith(".txt"):
-            file_path = str(docs_path / file)
-            successfully_loaded = False
-            
-            for encoding in encodings_to_try:
-                try:
-                    with open(file_path, encoding=encoding) as f:
-                        text = f.read()
-                    docs.append(Document(
-                        page_content=text,
-                        metadata={"source": file_path}
-                    ))
-                    successfully_loaded = True
-                    logger.info("Loaded [%d/%d] %s with %s", index, len(txt_files), file, encoding)
-                    break
-                except (UnicodeDecodeError, UnicodeError):
-                    continue
-            
-            if not successfully_loaded:
-                raise RuntimeError(f"Could not load {file} with any encoding: {encodings_to_try}")
+    docs = []
+    for index, path in enumerate(source_files, start=1):
+        file_path = str(path)
+        ext = path.suffix.lower()
+        try:
+            if ext == ".txt":
+                text = _load_txt(file_path)
+            elif ext == ".pdf":
+                text = _load_pdf(file_path)
+            elif ext == ".docx":
+                text = _load_docx(file_path)
+            else:
+                continue  # should not happen given the filter above
+
+            docs.append(Document(
+                page_content=text,
+                metadata={"source": file_path, "type": ext.lstrip(".")},
+            ))
+            logger.info("Loaded [%d/%d] %s (%s)", index, len(source_files), path.name, ext)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load {file_path}: {exc}") from exc
 
     if not docs:
-        raise ValueError(f"No .txt files found in {docs_path.resolve()}")
+        raise ValueError(
+            f"No supported files ({', '.join(SUPPORTED_EXTENSIONS)}) found in {docs_path.resolve()}"
+        )
     logger.info("Loaded %d documents successfully", len(docs))
     return docs
 
@@ -185,18 +255,33 @@ def build_faiss_batched(chunks: list[Document], embeddings: SentenceTransformerE
             "  Batch %d/%d finished | vectors=%d  total=%d chars embedded",
             idx + 1, total_batches, len(vectors), total_chars,
         )
-        return idx, vectors
+        return idx, vectors, total_chars
 
     # --- parallel embedding phase ---
     # OLLAMA_NUM_PARALLEL=8
     # seems does not work for embeddings
     #
     results: dict[int, list[list[float]]] = {}
+    completed_batches = 0
+    loaded_embeddings = 0
+    loaded_chars = 0
     with ThreadPoolExecutor(max_workers=num_threads) as executor:
         futures = {executor.submit(embed_batch, i, batch): i for i, batch in enumerate(batches)}
         for future in as_completed(futures):
-            idx, vectors = future.result()
+            idx, vectors, total_chars = future.result()
             results[idx] = vectors
+            completed_batches += 1
+            loaded_embeddings += len(vectors)
+            loaded_chars += total_chars
+
+            if completed_batches % 100 == 0:
+                logger.info(
+                    "Progress: completed %d/%d batches | embeddings loaded=%d | chars embedded=%d",
+                    completed_batches,
+                    total_batches,
+                    loaded_embeddings,
+                    loaded_chars,
+                )
 
     # --- sequential FAISS build phase (not thread-safe) ---
     all_texts = [doc.page_content for doc in chunks]
@@ -216,12 +301,15 @@ def build_faiss_batched(chunks: list[Document], embeddings: SentenceTransformerE
 
 
 def collect_docs_state(docs_dir: str) -> dict:
-    """Collect lightweight source state using file size + mtime_ns for .txt files."""
+    """Collect lightweight source state using file size + mtime_ns for all supported files."""
     docs_path = Path(docs_dir)
-    txt_files = sorted([p for p in docs_path.iterdir() if p.is_file() and p.suffix == ".txt"])
+    source_files = sorted([
+        p for p in docs_path.iterdir()
+        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+    ])
 
     files: dict[str, dict[str, int]] = {}
-    for path in txt_files:
+    for path in source_files:
         stat = path.stat()
         files[str(path.resolve())] = {
             "size": int(stat.st_size),
