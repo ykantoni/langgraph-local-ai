@@ -16,3 +16,6 @@ chroma_data/
 __pycache__/
 *.bin
 .vscode/
+frontend/node_modules/
+frontend/dist/
+frontend/.env
