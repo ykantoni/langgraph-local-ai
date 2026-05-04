@@ -14,6 +14,7 @@ function App() {
   const [input, setInput] = useState('')
   const [isSending, setIsSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [exitNotice, setExitNotice] = useState<string | null>(null)
 
   const canSend = input.trim().length > 0 && !isSending
 
@@ -71,6 +72,17 @@ function App() {
     }
   }
 
+  function exitApp() {
+    setExitNotice(
+      'To stop the app, close this tab and press Ctrl+C in the terminals running the frontend/backend.',
+    )
+    try {
+      window.close()
+    } catch {
+      // ignore
+    }
+  }
+
   return (
     <div className="page">
       <header className="topbar">
@@ -80,10 +92,14 @@ function App() {
           <a className="pill link" href={`${apiBase}/docs`} target="_blank" rel="noreferrer">
             API docs
           </a>
+          <button className="pill button" type="button" onClick={exitApp}>
+            Exit
+          </button>
         </div>
       </header>
 
       <main className="chat">
+        {exitNotice ? <div className="notice">{exitNotice}</div> : null}
         {messages.length === 0 ? (
           <div className="empty">
             <div className="emptyTitle">Ask a question about your local docs</div>
