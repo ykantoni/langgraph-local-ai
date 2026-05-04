@@ -3,6 +3,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List
 
+import numpy as np
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
@@ -177,6 +178,96 @@ def build_faiss_batched(
     return vectorstore
 
 
+def build_faiss_ivfpq_batched(
+    chunks: list[Document],
+    embeddings: SentenceTransformerEmbeddings,
+    batch_size: int,
+    num_threads: int,
+    *,
+    nlist: int,
+    pq_m: int,
+    pq_nbits: int,
+    nprobe: int,
+) -> FAISS:
+    """Build a FAISS IVF+PQ index.
+
+    Notes:
+    - IVF+PQ must be trained before adding vectors.
+    - We keep LangChain's FAISS wrapper (docstore + id mapping), but provide a custom FAISS index.
+    """
+    if not chunks:
+        raise ValueError("Cannot build vector index from empty chunk list")
+
+    # Reuse the existing batching implementation to produce the full embedding matrix.
+    batches = [chunks[i : i + batch_size] for i in range(0, len(chunks), batch_size)]
+    total_batches = len(batches)
+    logger.info(
+        "Embedding %d chunks in %d batches | batch_size=%d  threads=%d",
+        len(chunks),
+        total_batches,
+        batch_size,
+        num_threads,
+    )
+
+    def embed_batch(idx: int, batch: list[Document]):
+        texts = [doc.page_content for doc in batch]
+        vectors = embeddings.embed_documents(texts)
+        return idx, vectors
+
+    results: dict[int, list[list[float]]] = {}
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        futures = {executor.submit(embed_batch, i, batch): i for i, batch in enumerate(batches)}
+        for future in as_completed(futures):
+            idx, vectors = future.result()
+            results[idx] = vectors
+
+    all_texts = [doc.page_content for doc in chunks]
+    all_metas = [doc.metadata for doc in chunks]
+    all_vectors: list[list[float]] = []
+    for i in range(total_batches):
+        all_vectors.extend(results[i])
+
+    faiss_vectors = np.asarray(all_vectors, dtype=np.float32)
+    if faiss_vectors.ndim != 2:
+        raise ValueError(f"Unexpected embedding shape: {faiss_vectors.shape}")
+
+    dim = int(faiss_vectors.shape[1])
+    if pq_m <= 0 or dim % pq_m != 0:
+        raise ValueError(f"FAISS_PQ_M must divide embedding dim. dim={dim} pq_m={pq_m}")
+
+    # Build IVF+PQ index
+    from langchain_community.vectorstores.faiss import dependable_faiss_import
+    from langchain_community.docstore.in_memory import InMemoryDocstore
+
+    faiss = dependable_faiss_import()
+    quantizer = faiss.IndexFlatL2(dim)
+    index = faiss.IndexIVFPQ(quantizer, dim, int(nlist), int(pq_m), int(pq_nbits))
+
+    logger.info(
+        "Training FAISS IndexIVFPQ | vectors=%d dim=%d nlist=%d pq_m=%d pq_nbits=%d",
+        faiss_vectors.shape[0],
+        dim,
+        nlist,
+        pq_m,
+        pq_nbits,
+    )
+    index.train(faiss_vectors)
+    index.nprobe = int(nprobe)
+    index.add(faiss_vectors)
+    logger.info("FAISS IVF+PQ index ready (%d vectors indexed)", index.ntotal)
+
+    # Build the LangChain wrapper (docstore + id mapping) the usual way, then swap in the
+    # trained IVF+PQ index. The vectors are added in the same order, so the ID mapping remains
+    # correct.
+    tmp = FAISS.from_embeddings(
+        text_embeddings=list(zip(all_texts, all_vectors)),
+        embedding=embeddings,
+        metadatas=all_metas,
+    )
+    tmp.index = index
+    return tmp
+
+
 def get_or_create_vectorstore(settings: Settings, embeddings: SentenceTransformerEmbeddings) -> FAISS:
     has_index_files = os.path.exists(settings.faiss_index_file) and os.path.exists(settings.faiss_meta_file)
     source_changed = docs_changed(settings.docs_dir, settings.faiss_state_file)
@@ -205,11 +296,15 @@ def get_or_create_vectorstore(settings: Settings, embeddings: SentenceTransforme
     chunks = split_and_sanitize_documents(docs, max_chars=settings.embed_max_chars)
     logger.info("Prepared %d chunks for embedding", len(chunks))
 
-    vectorstore = build_faiss_batched(
+    vectorstore = build_faiss_ivfpq_batched(
         chunks,
         embeddings,
         batch_size=settings.embed_batch_size,
         num_threads=settings.embed_threads,
+        nlist=settings.faiss_nlist,
+        pq_m=settings.faiss_pq_m,
+        pq_nbits=settings.faiss_pq_nbits,
+        nprobe=settings.faiss_nprobe,
     )
     os.makedirs(settings.faiss_index_dir, exist_ok=True)
     vectorstore.save_local(folder_path=settings.faiss_index_dir, index_name=settings.faiss_index_name)

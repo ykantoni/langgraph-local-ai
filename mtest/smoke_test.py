@@ -19,6 +19,10 @@ class SmokeTest(unittest.TestCase):
             docs_dir="C:/tmp/docs",
             faiss_index_dir="C:/tmp/faiss_store",
             faiss_index_name="index",
+            faiss_nlist=256,
+            faiss_pq_m=64,
+            faiss_pq_nbits=8,
+            faiss_nprobe=16,
             embed_max_chars=1800,
             embed_batch_size=32,
             embed_threads=8,
@@ -29,30 +33,16 @@ class SmokeTest(unittest.TestCase):
         )
 
     def test_cli_main_wires_components_and_exits_without_running_agent(self) -> None:
-        fake_embeddings = object()
-        fake_vectorstore = object()
         fake_agent = MagicMock()
 
         with (
-            patch("local_agent.cli.load_settings", return_value=self.settings) as load_settings_mock,
-            patch("local_agent.cli.setup_logging") as setup_logging_mock,
-            patch("local_agent.cli.SentenceTransformerEmbeddings", return_value=fake_embeddings) as embeddings_cls,
-            patch("local_agent.cli.get_or_create_vectorstore", return_value=fake_vectorstore) as get_vectorstore_mock,
-            patch("local_agent.cli.create_chat_agent", return_value=fake_agent) as create_chat_agent_mock,
+            patch("local_agent.cli.load_chat_agent", return_value=(fake_agent, self.settings)) as load_chat_agent_mock,
             patch("builtins.input", side_effect=KeyboardInterrupt),
             patch("builtins.print") as print_mock,
         ):
             cli.main()
 
-        load_settings_mock.assert_called_once_with()
-        setup_logging_mock.assert_called_once_with(self.settings.log_level)
-        embeddings_cls.assert_called_once_with(
-            model_name=self.settings.st_embed_model,
-            encode_batch_size=self.settings.st_encode_batch,
-            device=self.settings.st_device,
-        )
-        get_vectorstore_mock.assert_called_once_with(self.settings, fake_embeddings)
-        create_chat_agent_mock.assert_called_once_with(fake_vectorstore, self.settings)
+        load_chat_agent_mock.assert_called_once_with()
         fake_agent.run.assert_not_called()
         print_mock.assert_called_once_with("\nExiting.")
 

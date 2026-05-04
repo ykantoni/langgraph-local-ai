@@ -66,10 +66,13 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+# curl 127.0.0.1:8000/health
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
+# curl -XPOST 127.0.0.1:8000/chat  -H "Content-Type: application/json" \
+#      -d "{\"message\": \"what are the options for INM High Availability\"}"
     @app.post("/chat", response_model=ChatResponse)
     def chat(body: ChatRequest) -> ChatResponse:
         if _agent is None:

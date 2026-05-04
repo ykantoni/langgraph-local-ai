@@ -13,6 +13,10 @@ class Settings:
     docs_dir: str
     faiss_index_dir: str
     faiss_index_name: str
+    faiss_nlist: int
+    faiss_pq_m: int
+    faiss_pq_nbits: int
+    faiss_nprobe: int
     embed_max_chars: int
     embed_batch_size: int
     embed_threads: int
@@ -45,6 +49,10 @@ def load_settings() -> Settings:
         docs_dir=os.environ.get("DOCS_DIR", "/docs"),
         faiss_index_dir=os.environ.get("FAISS_INDEX_DIR", "./faiss_store"),
         faiss_index_name=os.environ.get("FAISS_INDEX_NAME", "index"),
+        faiss_nlist=int(os.environ.get("FAISS_NLIST", "256")),
+        faiss_pq_m=int(os.environ.get("FAISS_PQ_M", "64")),
+        faiss_pq_nbits=int(os.environ.get("FAISS_PQ_NBITS", "8")),
+        faiss_nprobe=int(os.environ.get("FAISS_NPROBE", "16")),
         embed_max_chars=int(os.environ.get("EMBED_MAX_CHARS", "1800")),
         embed_batch_size=int(os.environ.get("EMBED_BATCH_SIZE", "32")),
         embed_threads=int(os.environ.get("EMBED_THREADS", "8")),
