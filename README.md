@@ -21,7 +21,10 @@ ollama pull nomic-embed-text
 ## Run
 
 ```powershell
-python .\agent.py
+cd frontend
+npm run build
+cd ..
+python -m local_agent.server
 ```
 
 Optional model overrides:

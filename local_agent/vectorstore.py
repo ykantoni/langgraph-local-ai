@@ -1,5 +1,6 @@
 import logging
 import os
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List
 
@@ -45,8 +46,18 @@ class SentenceTransformerEmbeddings(Embeddings):
             resolved_device = requested_device
 
         self._device = resolved_device
+        # Store HF downloads in a repo-local cache so startup doesn't re-fetch.
+        # You can force offline usage by setting HF_HUB_OFFLINE=1.
+        repo_root = Path(__file__).resolve().parents[1]
+        cache_dir = repo_root / ".hf-cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
         logger.info("Loading SentenceTransformer '%s' on %s ...", model_name, self._device)
-        self._model = SentenceTransformer(model_name, device=self._device)
+        self._model = SentenceTransformer(
+            model_name,
+            device=self._device,
+            cache_folder=str(cache_dir),
+            local_files_only=os.environ.get("HF_HUB_OFFLINE", "1") == "1",
+        )
         logger.info("SentenceTransformer model ready")
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:

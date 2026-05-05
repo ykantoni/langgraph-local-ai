@@ -3,12 +3,16 @@
 import os
 from pathlib import Path
 from contextlib import asynccontextmanager
+import json
+import queue
+import threading
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from local_agent.runtime import load_chat_agent
@@ -106,6 +110,92 @@ def create_app() -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e)) from e
         return ChatResponse(response=text if isinstance(text, str) else str(text))
+
+    @app.post("/chat/stream")
+    async def chat_stream(body: ChatRequest, request: Request):
+        """SSE streaming endpoint (ChatGPT-like).
+
+        Emits events:
+        - {type:"token", token:"..."}
+        - {type:"done"}
+        - {type:"error", error:"..."}
+        """
+        if _agent is None:
+            raise HTTPException(status_code=503, detail="Agent not initialized")
+
+        user_input = _build_input(body.message, body.history)
+
+        from langchain_core.callbacks import BaseCallbackHandler
+
+        token_q: "queue.Queue[str | None]" = queue.Queue()
+        err_q: "queue.Queue[str]" = queue.Queue()
+        cancel_event = threading.Event()
+
+        class TokenHandler(BaseCallbackHandler):
+            def on_llm_new_token(self, token: str, **kwargs):  # type: ignore[override]
+                # Don't raise here: it creates noisy logs. The SSE loop will stop
+                # on disconnect/cancel; this just prevents queue growth.
+                if cancel_event.is_set():
+                    return
+                if token:
+                    token_q.put(token)
+
+        handler = TokenHandler()
+
+        def run_agent():
+            try:
+                # AgentExecutor is a Runnable; pass callbacks via config.
+                _agent.invoke({"input": user_input}, config={"callbacks": [handler]})
+            except Exception as e:
+                err_q.put(str(e))
+            finally:
+                token_q.put(None)
+
+        t = threading.Thread(target=run_agent, daemon=True)
+        t.start()
+
+        async def sse():
+            # initial event helps the client start rendering immediately
+            yield f"data: {json.dumps({'type': 'start'})}\n\n"
+
+            while True:
+                # If the client disconnected, stop streaming immediately.
+                if cancel_event.is_set():
+                    return
+                try:
+                    if await request.is_disconnected():
+                        cancel_event.set()
+                        return
+                except Exception:
+                    # If disconnect detection fails, continue best-effort.
+                    pass
+                try:
+                    token = token_q.get(timeout=0.25)
+                except queue.Empty:
+                    if not err_q.empty():
+                        err = err_q.get_nowait()
+                        yield f"data: {json.dumps({'type': 'error', 'error': err})}\n\n"
+                        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                        return
+                    continue
+
+                if token is None:
+                    if not err_q.empty():
+                        err = err_q.get_nowait()
+                        yield f"data: {json.dumps({'type': 'error', 'error': err})}\n\n"
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                    return
+
+                yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
+
+        return StreamingResponse(
+            sse(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     return app
 

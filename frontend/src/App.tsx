@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import './App.css'
 
 type ChatRole = 'user' | 'assistant'
@@ -15,6 +15,7 @@ function App() {
   const [isSending, setIsSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [exitNotice, setExitNotice] = useState<string | null>(null)
+  const abortRef = useRef<AbortController | null>(null)
 
   const canSend = input.trim().length > 0 && !isSending
 
@@ -27,6 +28,24 @@ function App() {
     [messages],
   )
 
+  function appendAssistantPlaceholder() {
+    setMessages((prev) => [...prev, { role: 'assistant', content: '' }])
+  }
+
+  function updateLastAssistant(appendText: string) {
+    if (!appendText) return
+    setMessages((prev) => {
+      const next = [...prev]
+      for (let i = next.length - 1; i >= 0; i -= 1) {
+        if (next[i]?.role === 'assistant') {
+          next[i] = { ...next[i], content: (next[i].content ?? '') + appendText }
+          return next
+        }
+      }
+      return next
+    })
+  }
+
   async function send() {
     const text = input.trim()
     if (!text || isSending) return
@@ -34,14 +53,18 @@ function App() {
     setError(null)
     setIsSending(true)
     setInput('')
+    abortRef.current?.abort()
+    abortRef.current = new AbortController()
 
     // Optimistic user message
     setMessages((prev) => [...prev, { role: 'user', content: text }])
+    appendAssistantPlaceholder()
 
     try {
-      const res = await fetch(`${apiBase}/chat`, {
+      const res = await fetch(`${apiBase}/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: abortRef.current.signal,
         body: JSON.stringify({
           message: text,
           history,
@@ -53,34 +76,82 @@ function App() {
         throw new Error(`${res.status} ${res.statusText}${bodyText ? `: ${bodyText}` : ''}`)
       }
 
-      const data = (await res.json()) as { response?: string }
-      const reply = (data?.response ?? '').toString().trim()
-      setMessages((prev) => [...prev, { role: 'assistant', content: reply || '(empty response)' }])
+      if (!res.body) throw new Error('No response body (stream not supported?)')
+
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder('utf-8')
+      let buffer = ''
+
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+
+        // SSE frames end with a blank line
+        while (true) {
+          const frameEnd = buffer.indexOf('\n\n')
+          if (frameEnd === -1) break
+          const frame = buffer.slice(0, frameEnd)
+          buffer = buffer.slice(frameEnd + 2)
+
+          const dataLine = frame
+            .split('\n')
+            .find((l) => l.startsWith('data: '))
+            ?.slice('data: '.length)
+
+          if (!dataLine) continue
+
+          type StreamEvent =
+            | { type: 'start' }
+            | { type: 'token'; token: string }
+            | { type: 'error'; error: string }
+            | { type: 'done' }
+            | { type: string; [k: string]: unknown }
+
+          let evt: StreamEvent | null = null
+          try {
+            evt = JSON.parse(dataLine) as StreamEvent
+          } catch {
+            continue
+          }
+
+          if (evt?.type === 'token') {
+            const token = typeof (evt as any).token === 'string' ? (evt as any).token : ''
+            updateLastAssistant(token)
+          } else if (evt?.type === 'error') {
+            const msg = typeof (evt as any).error === 'string' ? (evt as any).error : 'Unknown error'
+            setError(msg)
+          } else if (evt?.type === 'done') {
+            // finish
+          }
+        }
+      }
     } catch (e) {
+      if (e instanceof DOMException && e.name === 'AbortError') {
+        updateLastAssistant('\n\n(stopped)')
+        return
+      }
       const msg = e instanceof Error ? e.message : String(e)
       setError(msg)
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: 'assistant',
-          content:
-            'Request failed. Check that the API server is running and CORS is configured.',
-        },
-      ])
+      updateLastAssistant(
+        '\n\nRequest failed. Check that the API server is running and CORS is configured.',
+      )
     } finally {
       setIsSending(false)
+      abortRef.current = null
     }
+  }
+
+  function stopGenerating() {
+    abortRef.current?.abort()
   }
 
   function exitApp() {
     setExitNotice(
       'To stop the app, close this tab and press Ctrl+C in the terminals running the frontend/backend.',
     )
-    try {
-      window.close()
-    } catch {
-      // ignore
-    }
+    // Browsers only allow scripts to close windows opened by scripts.
+    if (window.opener) window.close()
   }
 
   return (
@@ -137,9 +208,15 @@ function App() {
             }}
             rows={2}
           />
-          <button className="send" onClick={() => void send()} disabled={!canSend}>
-            {isSending ? 'Sending…' : 'Send'}
-          </button>
+          {isSending ? (
+            <button className="stop" onClick={stopGenerating} type="button">
+              Stop generating
+            </button>
+          ) : (
+            <button className="send" onClick={() => void send()} disabled={!canSend}>
+              Send
+            </button>
+          )}
         </div>
         <div className="hint">Enter to send, Shift+Enter for newline.</div>
       </footer>
