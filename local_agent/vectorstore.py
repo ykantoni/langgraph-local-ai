@@ -1,6 +1,8 @@
 import logging
 import os
 from pathlib import Path
+import re
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List
 
@@ -20,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 class SentenceTransformerEmbeddings(Embeddings):
     _QUERY_PROMPT = "Represent this sentence for searching relevant passages: "
+    _RE_SPACES = re.compile(r"[ \t]+")
+    _RE_MANY_BLANK_LINES = re.compile(r"\n{3,}")
 
     def __init__(
         self,
@@ -60,7 +64,32 @@ class SentenceTransformerEmbeddings(Embeddings):
         )
         logger.info("SentenceTransformer model ready")
 
+    @classmethod
+    def normalize_text(cls, text: str) -> str:
+        """Normalize text for stable embeddings (ASCII + UTF-8 safe).
+
+        - Unicode NFKC normalization (compatibility forms)
+        - Normalize newlines to \\n
+        - Remove NUL bytes
+        - Trim whitespace, collapse repeated spaces/tabs
+        - Collapse excessive blank lines
+        """
+        if not text:
+            return ""
+        text = unicodedata.normalize("NFKC", text)
+        text = text.replace("\x00", "")
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        # Trim each line and collapse horizontal whitespace
+        lines = []
+        for line in text.split("\n"):
+            line = cls._RE_SPACES.sub(" ", line).strip()
+            lines.append(line)
+        text = "\n".join(lines).strip()
+        text = cls._RE_MANY_BLANK_LINES.sub("\n\n", text)
+        return text
+
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        texts = [self.normalize_text(t) for t in texts]
         vectors = self._model.encode(
             texts,
             batch_size=self._encode_batch_size,
@@ -70,6 +99,7 @@ class SentenceTransformerEmbeddings(Embeddings):
         return [v.tolist() for v in vectors]
 
     def embed_query(self, text: str) -> List[float]:
+        text = self.normalize_text(text)
         vector = self._model.encode(
             [self._QUERY_PROMPT + text],
             normalize_embeddings=self._normalize,
@@ -89,7 +119,7 @@ def split_and_sanitize_documents(docs: list[Document], max_chars: int) -> list[D
     safe_chunks: list[Document] = []
     dropped = 0
     for chunk in chunks:
-        text = chunk.page_content.strip()
+        text = SentenceTransformerEmbeddings.normalize_text(chunk.page_content)
         if not text:
             dropped += 1
             continue
