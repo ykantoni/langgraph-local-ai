@@ -27,14 +27,6 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, description="Latest user message")
     session_id: str | None = Field(default=None, description="Server-side session id")
-    history: list[ChatMessage] | None = Field(
-        default=None,
-        description="(Deprecated) Prior turns; prefer server-side session_id",
-    )
-
-
-class ChatResponse(BaseModel):
-    response: str
 
 
 _agent = None
@@ -75,35 +67,9 @@ def _reset_session(session_id: str) -> None:
     with _sessions_lock:
         _sessions[session_id] = []
 
-def _resolve_history(body: ChatRequest) -> tuple[str | None, list[ChatMessage] | None]:
-    """Returns (session_id, history_for_prompt)."""
-    if body.session_id:
-        return body.session_id, _get_session_history(body.session_id)
-    return None, body.history
-
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Local agent chat API", lifespan=lifespan)
-
-    # Serve built frontend (Vite) if present.
-    # Build it via:  cd frontend && npm run build
-    dist_dir = Path(os.environ.get("FRONTEND_DIST_DIR", "./frontend/dist")).resolve()
-    assets_dir = dist_dir / "assets"
-    if dist_dir.exists() and (dist_dir / "index.html").exists():
-        if assets_dir.exists():
-            app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
-
-        @app.get("/", include_in_schema=False)
-        def ui_index() -> FileResponse:
-            return FileResponse(str(dist_dir / "index.html"))
-
-        # SPA fallback for client-side routes
-        @app.get("/{full_path:path}", include_in_schema=False)
-        def ui_fallback(full_path: str) -> FileResponse:
-            candidate = (dist_dir / full_path).resolve()
-            if str(candidate).startswith(str(dist_dir)) and candidate.exists() and candidate.is_file():
-                return FileResponse(str(candidate))
-            return FileResponse(str(dist_dir / "index.html"))
 
     origins_raw = os.environ.get("CHAT_CORS_ORIGINS", "*")
     origins = [o.strip() for o in origins_raw.split(",") if o.strip()]
@@ -129,34 +95,6 @@ def create_app() -> FastAPI:
         _reset_session(session_id)
         return {"session_id": session_id}
 
-    @app.post("/session/{session_id}/reset")
-    def session_reset(session_id: str) -> dict[str, str]:
-        _reset_session(session_id)
-        return {"session_id": session_id, "status": "reset"}
-
-    @app.get("/session/{session_id}/history")
-    def session_history(session_id: str) -> dict[str, list[ChatMessage]]:
-        return {"history": _get_session_history(session_id)}
-
-# curl -XPOST 127.0.0.1:8000/chat  -H "Content-Type: application/json" \
-#      -d "{\"message\": \"what are the options for INM High Availability\"}"
-    @app.post("/chat", response_model=ChatResponse)
-    def chat(body: ChatRequest) -> ChatResponse:
-        if _agent is None:
-            raise HTTPException(status_code=503, detail="Agent not initialized")
-        session_id, history = _resolve_history(body)
-        user_input = _build_input(body.message, history)
-        if session_id:
-            _append_session_message(session_id, ChatMessage(role="user", content=body.message))
-        try:
-            text = _agent.run(user_input)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e)) from e
-        response_text = text if isinstance(text, str) else str(text)
-        if session_id:
-            _append_session_message(session_id, ChatMessage(role="assistant", content=response_text))
-        return ChatResponse(response=response_text)
-
     @app.post("/chat/stream")
     async def chat_stream(body: ChatRequest, request: Request):
         """SSE streaming endpoint (ChatGPT-like).
@@ -169,7 +107,8 @@ def create_app() -> FastAPI:
         if _agent is None:
             raise HTTPException(status_code=503, detail="Agent not initialized")
 
-        session_id, history = _resolve_history(body)
+        session_id = body.session_id
+        history = _get_session_history(session_id) if session_id else None
         user_input = _build_input(body.message, history)
         if session_id:
             _append_session_message(session_id, ChatMessage(role="user", content=body.message))
@@ -253,6 +192,26 @@ def create_app() -> FastAPI:
                 "X-Accel-Buffering": "no",
             },
         )
+
+    # Serve built frontend (Vite) if present.
+    # Build it via:  cd frontend && npm run build
+    dist_dir = Path(os.environ.get("FRONTEND_DIST_DIR", "./frontend/dist")).resolve()
+    assets_dir = dist_dir / "assets"
+    if dist_dir.exists() and (dist_dir / "index.html").exists():
+        if assets_dir.exists():
+            app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+        @app.get("/", include_in_schema=False)
+        def ui_index() -> FileResponse:
+            return FileResponse(str(dist_dir / "index.html"))
+
+        # SPA fallback for client-side routes (registered last so it won't shadow API routes)
+        @app.get("/{full_path:path}", include_in_schema=False)
+        def ui_fallback(full_path: str) -> FileResponse:
+            candidate = (dist_dir / full_path).resolve()
+            if str(candidate).startswith(str(dist_dir)) and candidate.exists() and candidate.is_file():
+                return FileResponse(str(candidate))
+            return FileResponse(str(dist_dir / "index.html"))
 
     return app
 

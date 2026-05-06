@@ -89,7 +89,7 @@ class SmokeTest(unittest.TestCase):
             patch("local_agent.vectorstore.docs_changed", return_value=False),
             patch("local_agent.vectorstore.FAISS.load_local", return_value=loaded_vectorstore) as load_local_mock,
             patch("local_agent.vectorstore.load_documents") as load_documents_mock,
-            patch("local_agent.vectorstore.build_faiss_batched") as build_faiss_mock,
+            patch("local_agent.vectorstore.build_faiss_ivfpq_batched") as build_faiss_mock,
         ):
             result = vectorstore.get_or_create_vectorstore(self.settings, embeddings)
 
