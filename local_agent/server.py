@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 import json
 import queue
 import threading
+import uuid
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Request
@@ -25,9 +26,10 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, description="Latest user message")
+    session_id: str | None = Field(default=None, description="Server-side session id")
     history: list[ChatMessage] | None = Field(
         default=None,
-        description="Prior turns; server turns them into context for the agent",
+        description="(Deprecated) Prior turns; prefer server-side session_id",
     )
 
 
@@ -36,6 +38,8 @@ class ChatResponse(BaseModel):
 
 
 _agent = None
+_sessions_lock = threading.Lock()
+_sessions: dict[str, list[ChatMessage]] = {}
 
 
 @asynccontextmanager
@@ -55,6 +59,27 @@ def _build_input(message: str, history: list[ChatMessage] | None) -> str:
         parts.append(f"{label}: {m.content}")
     parts.append(f"User: {message}")
     return "\n".join(parts)
+
+def _new_session_id() -> str:
+    return uuid.uuid4().hex
+
+def _get_session_history(session_id: str) -> list[ChatMessage]:
+    with _sessions_lock:
+        return list(_sessions.get(session_id, []))
+
+def _append_session_message(session_id: str, msg: ChatMessage) -> None:
+    with _sessions_lock:
+        _sessions.setdefault(session_id, []).append(msg)
+
+def _reset_session(session_id: str) -> None:
+    with _sessions_lock:
+        _sessions[session_id] = []
+
+def _resolve_history(body: ChatRequest) -> tuple[str | None, list[ChatMessage] | None]:
+    """Returns (session_id, history_for_prompt)."""
+    if body.session_id:
+        return body.session_id, _get_session_history(body.session_id)
+    return None, body.history
 
 
 def create_app() -> FastAPI:
@@ -98,18 +123,39 @@ def create_app() -> FastAPI:
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.post("/session/new")
+    def session_new() -> dict[str, str]:
+        session_id = _new_session_id()
+        _reset_session(session_id)
+        return {"session_id": session_id}
+
+    @app.post("/session/{session_id}/reset")
+    def session_reset(session_id: str) -> dict[str, str]:
+        _reset_session(session_id)
+        return {"session_id": session_id, "status": "reset"}
+
+    @app.get("/session/{session_id}/history")
+    def session_history(session_id: str) -> dict[str, list[ChatMessage]]:
+        return {"history": _get_session_history(session_id)}
+
 # curl -XPOST 127.0.0.1:8000/chat  -H "Content-Type: application/json" \
 #      -d "{\"message\": \"what are the options for INM High Availability\"}"
     @app.post("/chat", response_model=ChatResponse)
     def chat(body: ChatRequest) -> ChatResponse:
         if _agent is None:
             raise HTTPException(status_code=503, detail="Agent not initialized")
-        user_input = _build_input(body.message, body.history)
+        session_id, history = _resolve_history(body)
+        user_input = _build_input(body.message, history)
+        if session_id:
+            _append_session_message(session_id, ChatMessage(role="user", content=body.message))
         try:
             text = _agent.run(user_input)
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e)) from e
-        return ChatResponse(response=text if isinstance(text, str) else str(text))
+        response_text = text if isinstance(text, str) else str(text)
+        if session_id:
+            _append_session_message(session_id, ChatMessage(role="assistant", content=response_text))
+        return ChatResponse(response=response_text)
 
     @app.post("/chat/stream")
     async def chat_stream(body: ChatRequest, request: Request):
@@ -123,13 +169,17 @@ def create_app() -> FastAPI:
         if _agent is None:
             raise HTTPException(status_code=503, detail="Agent not initialized")
 
-        user_input = _build_input(body.message, body.history)
+        session_id, history = _resolve_history(body)
+        user_input = _build_input(body.message, history)
+        if session_id:
+            _append_session_message(session_id, ChatMessage(role="user", content=body.message))
 
         from langchain_core.callbacks import BaseCallbackHandler
 
         token_q: "queue.Queue[str | None]" = queue.Queue()
         err_q: "queue.Queue[str]" = queue.Queue()
         cancel_event = threading.Event()
+        assistant_parts: list[str] = []
 
         class TokenHandler(BaseCallbackHandler):
             def on_llm_new_token(self, token: str, **kwargs):  # type: ignore[override]
@@ -138,6 +188,7 @@ def create_app() -> FastAPI:
                 if cancel_event.is_set():
                     return
                 if token:
+                    assistant_parts.append(token)
                     token_q.put(token)
 
         handler = TokenHandler()
@@ -183,6 +234,12 @@ def create_app() -> FastAPI:
                     if not err_q.empty():
                         err = err_q.get_nowait()
                         yield f"data: {json.dumps({'type': 'error', 'error': err})}\n\n"
+                    else:
+                        if session_id:
+                            _append_session_message(
+                                session_id,
+                                ChatMessage(role="assistant", content="".join(assistant_parts)),
+                            )
                     yield f"data: {json.dumps({'type': 'done'})}\n\n"
                     return
 

@@ -1,10 +1,11 @@
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import './App.css'
 
 type ChatRole = 'user' | 'assistant'
 type ChatMessage = { role: ChatRole; content: string }
 
 const DEFAULT_API_BASE = 'http://127.0.0.1:8000'
+const SESSION_KEY = 'local-agent.session-id'
 
 function App() {
   const apiBase =
@@ -16,17 +17,31 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [exitNotice, setExitNotice] = useState<string | null>(null)
   const abortRef = useRef<AbortController | null>(null)
+  const [sessionId, setSessionId] = useState<string | null>(
+    () => window.localStorage.getItem(SESSION_KEY) || null,
+  )
 
   const canSend = input.trim().length > 0 && !isSending
 
-  const history = useMemo(
-    () =>
-      messages.map((m) => ({
-        role: m.role,
-        content: m.content,
-      })),
-    [messages],
-  )
+  useEffect(() => {
+    if (sessionId) return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const res = await fetch(`${apiBase}/session/new`, { method: 'POST' })
+        const data = (await res.json()) as { session_id?: string }
+        if (!cancelled && data.session_id) {
+          window.localStorage.setItem(SESSION_KEY, data.session_id)
+          setSessionId(data.session_id)
+        }
+      } catch {
+        // ignore; user can still use stateless history if needed
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [apiBase, sessionId])
 
   function appendAssistantPlaceholder() {
     setMessages((prev) => [...prev, { role: 'assistant', content: '' }])
@@ -67,7 +82,7 @@ function App() {
         signal: abortRef.current.signal,
         body: JSON.stringify({
           message: text,
-          history,
+          session_id: sessionId,
         }),
       })
 
@@ -146,6 +161,22 @@ function App() {
     abortRef.current?.abort()
   }
 
+  async function newChat() {
+    try {
+      const res = await fetch(`${apiBase}/session/new`, { method: 'POST' })
+      const data = (await res.json()) as { session_id?: string }
+      if (data.session_id) {
+        window.localStorage.setItem(SESSION_KEY, data.session_id)
+        setSessionId(data.session_id)
+        setMessages([])
+        setError(null)
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setError(msg)
+    }
+  }
+
   function exitApp() {
     setExitNotice(
       'To stop the app, close this tab and press Ctrl+C in the terminals running the frontend/backend.',
@@ -160,9 +191,13 @@ function App() {
         <div className="brand">Local Agent Chat</div>
         <div className="meta">
           <span className="pill">API: {apiBase}</span>
+          {sessionId ? <span className="pill">session: {sessionId.slice(0, 8)}…</span> : null}
           <a className="pill link" href={`${apiBase}/docs`} target="_blank" rel="noreferrer">
             API docs
           </a>
+          <button className="pill button" type="button" onClick={() => void newChat()}>
+            New chat
+          </button>
           <button className="pill button" type="button" onClick={exitApp}>
             Exit
           </button>
