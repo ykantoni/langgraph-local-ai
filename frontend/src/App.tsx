@@ -97,11 +97,7 @@ function App() {
       const decoder = new TextDecoder('utf-8')
       let buffer = ''
 
-      while (true) {
-        const { value, done } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-
+      const processFrames = () => {
         // SSE frames end with a blank line
         while (true) {
           const frameEnd = buffer.indexOf('\n\n')
@@ -134,13 +130,26 @@ function App() {
             const token = typeof (evt as any).token === 'string' ? (evt as any).token : ''
             updateLastAssistant(token)
           } else if (evt?.type === 'error') {
-            const msg = typeof (evt as any).error === 'string' ? (evt as any).error : 'Unknown error'
+            const msg =
+              typeof (evt as any).error === 'string' ? (evt as any).error : 'Unknown error'
             setError(msg)
           } else if (evt?.type === 'done') {
             // finish
           }
         }
       }
+
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        processFrames()
+      }
+
+      // Flush the TextDecoder to avoid losing multi-byte UTF-8 chars that end exactly
+      // at the final chunk boundary.
+      buffer += decoder.decode()
+      processFrames()
     } catch (e) {
       if (e instanceof DOMException && e.name === 'AbortError') {
         updateLastAssistant('\n\n(stopped)')

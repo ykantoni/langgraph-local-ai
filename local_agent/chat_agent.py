@@ -20,7 +20,6 @@ def create_chat_agent(vectorstore, settings: Settings):
         model=settings.ollama_chat_model,
         temperature=0,
         base_url=settings.ollama_base_url,
-        streaming=True,
     )
 
     return initialize_agent(
