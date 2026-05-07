@@ -53,29 +53,28 @@ class SmokeTest(unittest.TestCase):
             Document(page_content="second result", metadata={}),
         ]
         llm_instance = object()
-        agent_instance = object()
+        graph_instance = MagicMock()
+        graph_instance.invoke.return_value = {}
 
         with (
             patch("local_agent.chat_agent.ChatOllama", return_value=llm_instance) as chat_ollama_mock,
-            patch("local_agent.chat_agent.initialize_agent", return_value=agent_instance) as initialize_agent_mock,
+            patch("local_agent.chat_agent.create_agent", return_value=graph_instance) as create_agent_mock,
         ):
             created_agent = chat_agent.create_chat_agent(vectorstore_mock, self.settings)
 
-        self.assertIs(created_agent, agent_instance)
+        self.assertIs(created_agent.graph, graph_instance)
         chat_ollama_mock.assert_called_once_with(
             model=self.settings.ollama_chat_model,
             temperature=0,
             base_url=self.settings.ollama_base_url,
+            streaming=True,
         )
-        initialize_agent_mock.assert_called_once()
+        create_agent_mock.assert_called_once()
+        self.assertIs(create_agent_mock.call_args.args[0], llm_instance)
+        tools = create_agent_mock.call_args.kwargs["tools"]
+        self.assertEqual(len(tools), 1)
 
-        kwargs = initialize_agent_mock.call_args.kwargs
-        self.assertEqual(kwargs["llm"], llm_instance)
-        self.assertEqual(kwargs["agent"], chat_agent.AgentType.ZERO_SHOT_REACT_DESCRIPTION)
-        self.assertTrue(kwargs["verbose"])
-        self.assertEqual(len(kwargs["tools"]), 1)
-
-        search_tool = kwargs["tools"][0]
+        search_tool = tools[0]
         tool_result = search_tool.func("test query")
         vectorstore_mock.similarity_search.assert_called_once_with("test query", k=3)
         self.assertEqual(tool_result, "first result\n\nsecond result")

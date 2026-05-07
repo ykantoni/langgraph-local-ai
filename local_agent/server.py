@@ -175,10 +175,14 @@ def create_app() -> FastAPI:
                         yield f"data: {json.dumps({'type': 'error', 'error': err})}\n\n"
                     else:
                         if session_id:
-                            _append_session_message(
-                                session_id,
-                                ChatMessage(role="assistant", content="".join(assistant_parts)),
-                            )
+                            assistant_text = "".join(assistant_parts).strip()
+                            # Token streaming callbacks are best-effort; if nothing arrived,
+                            # don't persist an empty assistant message (Pydantic min_length=1).
+                            if assistant_text:
+                                _append_session_message(
+                                    session_id,
+                                    ChatMessage(role="assistant", content=assistant_text),
+                                )
                     yield f"data: {json.dumps({'type': 'done'})}\n\n"
                     return
 
