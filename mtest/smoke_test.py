@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from langchain_core.documents import Document
+from langchain_core.messages import AIMessage
 
 from local_agent import chat_agent, cli, vectorstore
 from local_agent.config import Settings
@@ -52,32 +53,59 @@ class SmokeTest(unittest.TestCase):
             Document(page_content="first result", metadata={}),
             Document(page_content="second result", metadata={}),
         ]
-        llm_instance = object()
-        graph_instance = MagicMock()
-        graph_instance.invoke.return_value = {}
+        llm_instance = MagicMock()
+        llm_tools_instance = MagicMock()
+        llm_instance.bind_tools.return_value = llm_tools_instance
+
+        captured_tool = {}
+
+        class FakeTool:
+            def __init__(self, name: str, func, description: str):
+                self.name = name
+                self.func = func
+                self.description = description
+                captured_tool["tool"] = self
+
+        def FakeToolNode(_tools):
+            # The graph won't route to tools in this test (no tool calls),
+            # but we need a valid node callable for compilation.
+            def _node(_state):
+                return {}
+
+            return _node
+
+        # planner + synthesizer calls
+        llm_instance.invoke.side_effect = [
+            AIMessage(content="- Search docs\n- Answer\n"),
+            AIMessage(content="Final answer"),
+        ]
+        # executor call (no tool calls → goes straight to synthesizer)
+        llm_tools_instance.invoke.return_value = AIMessage(content="(executor step)")
 
         with (
             patch("local_agent.chat_agent.ChatOllama", return_value=llm_instance) as chat_ollama_mock,
-            patch("local_agent.chat_agent.create_agent", return_value=graph_instance) as create_agent_mock,
+            patch("local_agent.chat_agent.Tool", FakeTool),
+            patch("local_agent.chat_agent.ToolNode", FakeToolNode),
         ):
             created_agent = chat_agent.create_chat_agent(vectorstore_mock, self.settings)
 
-        self.assertIs(created_agent.graph, graph_instance)
+        self.assertTrue(hasattr(created_agent, "graph"))
         chat_ollama_mock.assert_called_once_with(
             model=self.settings.ollama_chat_model,
             temperature=0,
             base_url=self.settings.ollama_base_url,
             streaming=True,
         )
-        create_agent_mock.assert_called_once()
-        self.assertIs(create_agent_mock.call_args.args[0], llm_instance)
-        tools = create_agent_mock.call_args.kwargs["tools"]
-        self.assertEqual(len(tools), 1)
 
-        search_tool = tools[0]
+        # Ensure tool function is correctly wired to the vectorstore.
+        search_tool = captured_tool["tool"]
         tool_result = search_tool.func("test query")
         vectorstore_mock.similarity_search.assert_called_once_with("test query", k=3)
         self.assertEqual(tool_result, "first result\n\nsecond result")
+
+        # Ensure the resulting graph is invokable and returns messages.
+        result = created_agent.invoke({"input": "hello"})
+        self.assertIn("messages", result)
 
     def test_get_or_create_vectorstore_uses_saved_index_when_docs_unchanged(self) -> None:
         embeddings = MagicMock()
