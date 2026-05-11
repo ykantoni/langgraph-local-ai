@@ -3,11 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, TypedDict
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import Tool
 from langchain_ollama import ChatOllama
-from langgraph.graph import END, START, StateGraph
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.graph import END, StateGraph
 
 import logging
 
@@ -82,16 +80,14 @@ def create_chat_agent(vectorstore, settings: Settings) -> LocalGraphAgent:
         streaming=True,
     )
 
-    llm_with_tools = llm.bind_tools([search_tool])
-
     def planner(state: AgentState) -> AgentState:
         logger.info("planner: start (question_chars=%d)", len(state.get("question", "") or ""))
         prompt = f"""
-            Create a short 3 steps step-by-step plan to answer the following question:
+            Given that context contains result of local documents search create a short 3 steps step-by-step plan to answer the following question:
             {state['question']}
 
             Use steps like:
-            - always search local docs
+            - analyze the question and context
             - summarize the information
             - combine the information
 
@@ -106,24 +102,30 @@ def create_chat_agent(vectorstore, settings: Settings) -> LocalGraphAgent:
             **state,
             "plan": steps,
             "current_step": 0,
-            "intermediate_results": []
+            "intermediate_results": [],
+        }
+
+    def retrieve(state: AgentState) -> AgentState:
+        """Always run local document search once after planning."""
+        q = state.get("question", "") or ""
+        logger.info("retrieve: start (question_chars=%d)", len(q))
+        docs = search_docs(q)
+        logger.info("retrieve: done (docs_chars=%d)", len(docs or ""))
+        return {
+            **state,
+            "intermediate_results": (state.get("intermediate_results") or []) + [docs],
         }
 
     def executor(state: AgentState) -> AgentState:
         step_idx = int(state.get("current_step", 0) or 0)
         plan_len = len(state.get("plan") or [])
         step = (state.get("plan") or [""])[step_idx] if step_idx < plan_len else ""
-        if step_idx > 0:
-            prior = "\n\n".join(state.get("intermediate_results") or [])
-            if prior:
-                step = f"{step}\n\nPrior context:\n{prior}"
+        prior = "\n\n".join(state.get("intermediate_results") or [])
+        step = f"{step}. Keep the answer short and concise.\n\nPrior context:\n{prior}"
 
         logger.info("executor: start (step=%d/%d step_chars=%d)", step_idx + 1, plan_len, len(step or ""))
 
-        if step_idx == 0:
-            result = search_docs(state["question"])
-        else:
-            result = llm.invoke(step).content
+        result = llm.invoke(step).content
         logger.info("executor: done (result_chars=%d)", len(result or ""))
 
         return {
@@ -147,7 +149,7 @@ def create_chat_agent(vectorstore, settings: Settings) -> LocalGraphAgent:
         )
 
         prompt = f"""
-        Answer the question using the context below.
+        Answer the question using the context below. Keep the anwser short and concise.
 
         Question:
         {state['question']}
@@ -164,17 +166,17 @@ def create_chat_agent(vectorstore, settings: Settings) -> LocalGraphAgent:
             "final_answer": answer
         }
 
-    tools_node = ToolNode([search_tool])
-
     g = StateGraph(AgentState)
 
     g.add_node("planner", planner)
+    g.add_node("retrieve", retrieve)
     g.add_node("executor", executor)
     g.add_node("synthesizer", synthesizer)
 
     g.set_entry_point("planner")
 
-    g.add_edge("planner", "executor")
+    g.add_edge("planner", "retrieve")
+    g.add_edge("retrieve", "executor")
     g.add_conditional_edges("executor", should_continue)
     g.add_edge("synthesizer", END)
 
