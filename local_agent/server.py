@@ -5,7 +5,9 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 import json
 import queue
+import re
 import threading
+from queue import Empty
 import uuid
 from typing import Literal
 
@@ -100,9 +102,13 @@ def create_app() -> FastAPI:
         """SSE streaming endpoint (ChatGPT-like).
 
         Emits events:
-        - {type:"token", token:"..."}
+        - {type:"token", token:"..."}  (batched: often a full sentence or multi-token chunk)
         - {type:"done"}
         - {type:"error", error:"..."}
+
+        Tuning via env (optional):
+        - CHAT_SSE_CHUNK_CHARS: max chars before a hard flush (default 400)
+        - CHAT_SSE_MIN_SOFT_CHARS: min buffered chars before soft flush on .!? or newline (default 24)
         """
         if _agent is None:
             raise HTTPException(status_code=503, detail="Agent not initialized")
@@ -120,17 +126,77 @@ def create_app() -> FastAPI:
         cancel_event = threading.Event()
         assistant_parts: list[str] = []
 
-        class TokenHandler(BaseCallbackHandler):
-            def on_llm_new_token(self, token: str, **kwargs):  # type: ignore[override]
-                # Don't raise here: it creates noisy logs. The SSE loop will stop
-                # on disconnect/cancel; this just prevents queue growth.
-                if cancel_event.is_set():
-                    return
-                if token:
-                    assistant_parts.append(token)
-                    token_q.put(token)
+        chunk_chars = max(64, int(os.environ.get("CHAT_SSE_CHUNK_CHARS", "400")))
+        min_soft = max(8, int(os.environ.get("CHAT_SSE_MIN_SOFT_CHARS", "24")))
 
-        handler = TokenHandler()
+        class BatchingTokenHandler(BaseCallbackHandler):
+            """Buffer LLM tokens; emit on sentence boundary, newline, or size cap."""
+
+            _SENTENCE_END = re.compile(r"[.!?](?:\s|$)")
+
+            def __init__(self) -> None:
+                super().__init__()
+                self._buf = ""
+                self._lock = threading.Lock()
+
+            def on_llm_new_token(self, token: str, **kwargs):  # type: ignore[override]
+                if cancel_event.is_set() or not token:
+                    return
+                assistant_parts.append(token)
+                outgoing: list[str] = []
+                with self._lock:
+                    self._buf += token
+                    while True:
+                        piece = self._pop_chunk()
+                        if piece is None:
+                            break
+                        outgoing.append(piece)
+                for piece in outgoing:
+                    token_q.put(piece)
+
+            def _pop_chunk(self) -> str | None:
+                b = self._buf
+                if not b:
+                    return None
+
+                if len(b) >= chunk_chars:
+                    self._buf = b[chunk_chars:]
+                    return b[:chunk_chars]
+
+                # Clear sentence boundaries (common in English) — flush even if buffer is short.
+                for sep in (". ", "! ", "? ", ".\n", "!\n", "?\n", ".\t", "!\t", "?\t"):
+                    idx = b.find(sep)
+                    if idx != -1:
+                        cut = idx + len(sep)
+                        chunk = b[:cut]
+                        self._buf = b[cut:]
+                        return chunk
+
+                if len(b) >= min_soft:
+                    nl = b.find("\n")
+                    if nl != -1:
+                        line_len = nl + 1
+                        if line_len >= min_soft or nl + 1 == len(b):
+                            self._buf = b[line_len:]
+                            return b[:line_len]
+
+                    m = self._SENTENCE_END.search(b)
+                    if m is not None and m.end() >= min_soft:
+                        cut = m.end()
+                        chunk = b[:cut]
+                        self._buf = b[cut:]
+                        return chunk
+
+                return None
+
+            def flush(self) -> None:
+                with self._lock:
+                    rest = self._buf
+                    self._buf = ""
+                if rest:
+                    token_q.put(rest)
+
+        handler = BatchingTokenHandler()
 
         def run_agent():
             try:
@@ -139,6 +205,7 @@ def create_app() -> FastAPI:
             except Exception as e:
                 err_q.put(str(e))
             finally:
+                handler.flush()
                 token_q.put(None)
 
         t = threading.Thread(target=run_agent, daemon=True)
@@ -161,7 +228,7 @@ def create_app() -> FastAPI:
                     pass
                 try:
                     token = token_q.get(timeout=0.25)
-                except queue.Empty:
+                except Empty:
                     if not err_q.empty():
                         err = err_q.get_nowait()
                         yield f"data: {json.dumps({'type': 'error', 'error': err})}\n\n"
@@ -186,7 +253,18 @@ def create_app() -> FastAPI:
                     yield f"data: {json.dumps({'type': 'done'})}\n\n"
                     return
 
-                yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
+                merged = token
+                while True:
+                    try:
+                        nxt = token_q.get_nowait()
+                    except Empty:
+                        break
+                    if nxt is None:
+                        token_q.put(None)
+                        break
+                    merged += nxt
+
+                yield f"data: {json.dumps({'type': 'token', 'token': merged})}\n\n"
 
         return StreamingResponse(
             sse(),

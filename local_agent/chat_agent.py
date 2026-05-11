@@ -87,7 +87,7 @@ def create_chat_agent(vectorstore, settings: Settings) -> LocalGraphAgent:
     def planner(state: AgentState) -> AgentState:
         logger.info("planner: start (question_chars=%d)", len(state.get("question", "") or ""))
         prompt = f"""
-            Create a short (maximum 5 steps) step-by-step plan to answer the following question:
+            Create a short 3 steps step-by-step plan to answer the following question:
             {state['question']}
 
             Use steps like:
@@ -95,7 +95,7 @@ def create_chat_agent(vectorstore, settings: Settings) -> LocalGraphAgent:
             - summarize the information
             - combine the information
 
-            Return as a numbered list.
+            Return as a numbered list. Keep the plan short and concise.
             """
         plan_text = llm.invoke(prompt).content
 
@@ -113,14 +113,14 @@ def create_chat_agent(vectorstore, settings: Settings) -> LocalGraphAgent:
         step_idx = int(state.get("current_step", 0) or 0)
         plan_len = len(state.get("plan") or [])
         step = (state.get("plan") or [""])[step_idx] if step_idx < plan_len else ""
-        if "*search local documents" not in step.lower():
+        if step_idx > 0:
             prior = "\n\n".join(state.get("intermediate_results") or [])
             if prior:
                 step = f"{step}\n\nPrior context:\n{prior}"
 
         logger.info("executor: start (step=%d/%d step_chars=%d)", step_idx + 1, plan_len, len(step or ""))
 
-        if "*search local documents" in step.lower():
+        if step_idx == 0:
             result = search_docs(state["question"])
         else:
             result = llm.invoke(step).content
