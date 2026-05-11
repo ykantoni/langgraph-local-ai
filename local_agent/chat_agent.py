@@ -9,12 +9,19 @@ from langchain_ollama import ChatOllama
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
+import logging
+
 from local_agent.config import Settings
 
+logger = logging.getLogger(__name__)
 
-class AgentState(TypedDict, total=False):
-    messages: list[Any]
-    plan: str
+
+class AgentState(TypedDict):
+    question: str
+    plan: list[str]
+    current_step: int
+    intermediate_results: list[str]
+    final_answer: str
 
 
 @dataclass(frozen=True)
@@ -32,26 +39,35 @@ class LocalGraphAgent:
         if not isinstance(text, str) or not text.strip():
             raise ValueError("Expected inputs={'input': <non-empty str>}")
 
-        result = self.graph.invoke(
-            {"messages": [HumanMessage(content=text)]},
+        result = self.graph.invoke({
+                "question": text,
+                "plan": [],
+                "current_step": 0,
+                "intermediate_results": [],
+                "final_answer": ""
+            },
             config=config,
         )
         return result
 
     def run(self, query: str) -> str:
         result = self.invoke({"input": query})
-        messages = result.get("messages") or []
-        for m in reversed(messages):
-            if isinstance(m, AIMessage) and m.content:
-                return str(m.content)
-        return ""
+        messages = result.get("intermediate_results") or ""
+        return messages
 
 
 def create_chat_agent(vectorstore, settings: Settings) -> LocalGraphAgent:
-    
+
     def search_docs(query: str) -> str:
+        logger.info("search_docs: start (query_chars=%d)", len(query or ""))
         results = vectorstore.similarity_search(query, k=3)
-        return "\n\n".join([r.page_content for r in results])
+        out = "\n\n".join([r.page_content for r in results])
+        logger.info(
+            "search_docs: done (results=%d out_chars=%d)",
+            len(results or []),
+            len(out),
+        )
+        return out
 
     search_tool = Tool(
         name="LocalDocumentSearch",
@@ -69,59 +85,97 @@ def create_chat_agent(vectorstore, settings: Settings) -> LocalGraphAgent:
     llm_with_tools = llm.bind_tools([search_tool])
 
     def planner(state: AgentState) -> AgentState:
-        # Keep the plan short; it will be fed into later nodes as context.
-        planner_msg = llm.invoke(
-            [
-                SystemMessage(
-                    content=(
-                        "You are a planner for a local-document QA assistant.\n"
-                        "Write a short plan (3-6 bullets) for how to answer the user.\n"
-                        "If local docs are likely relevant, include a step to search them.\n"
-                        "Do not answer the question yet; output only the plan."
-                    )
-                ),
-                *state.get("messages", []),
-            ]
-        )
-        plan_text = (getattr(planner_msg, "content", "") or "").strip()
-        return {"plan": plan_text}
+        logger.info("planner: start (question_chars=%d)", len(state.get("question", "") or ""))
+        prompt = f"""
+            Create a short (maximum 5 steps) step-by-step plan to answer the following question:
+            {state['question']}
+
+            Use steps like:
+            - always search local docs
+            - summarize the information
+            - combine the information
+
+            Return as a numbered list.
+            """
+        plan_text = llm.invoke(prompt).content
+
+        steps = [s.strip() for s in plan_text.split("\n") if s.strip()]
+        logger.info("planner: done (steps=%d plan_chars=%d)", len(steps), len(plan_text or ""))
+
+        return {
+            **state,
+            "plan": steps,
+            "current_step": 0,
+            "intermediate_results": []
+        }
 
     def executor(state: AgentState) -> AgentState:
-        plan = state.get("plan", "").strip()
-        exec_system = (
-            "You are the executor. Use tools when needed to gather facts.\n"
-            "When you are ready to write the final answer, do NOT answer yet; just stop calling tools.\n"
-        )
-        if plan:
-            exec_system += f"\nPlan:\n{plan}\n"
+        step_idx = int(state.get("current_step", 0) or 0)
+        plan_len = len(state.get("plan") or [])
+        step = (state.get("plan") or [""])[step_idx] if step_idx < plan_len else ""
+        if "*search local documents" not in step.lower():
+            prior = "\n\n".join(state.get("intermediate_results") or [])
+            if prior:
+                step = f"{step}\n\nPrior context:\n{prior}"
 
-        msg = llm_with_tools.invoke([SystemMessage(content=exec_system), *state.get("messages", [])])
-        return {"messages": [msg]}
+        logger.info("executor: start (step=%d/%d step_chars=%d)", step_idx + 1, plan_len, len(step or ""))
+
+        if "*search local documents" in step.lower():
+            result = search_docs(state["question"])
+        else:
+            result = llm.invoke(step).content
+        logger.info("executor: done (result_chars=%d)", len(result or ""))
+
+        return {
+            **state,
+            "intermediate_results": state["intermediate_results"] + [result],
+            "current_step": step_idx + 1,
+        }
+
+    def should_continue(state: AgentState):
+        if state["current_step"] >= len(state["plan"]):
+            return "synthesizer"
+        return "executor"
 
     def synthesizer(state: AgentState) -> AgentState:
-        plan = state.get("plan", "").strip()
-        synth_system = (
-            "You are the synthesizer. Produce the final answer to the user.\n"
-            "Use tool results already present in the conversation. Be concise and accurate.\n"
+        context = "\n\n".join(state["intermediate_results"])
+        logger.info(
+            "synthesizer: start (question_chars=%d context_chars=%d steps=%d)",
+            len(state.get("question", "") or ""),
+            len(context),
+            len(state.get("plan") or []),
         )
-        if plan:
-            synth_system += f"\n(Plan used)\n{plan}\n"
 
-        msg = llm.invoke([SystemMessage(content=synth_system), *state.get("messages", [])])
-        return {"messages": [msg]}
+        prompt = f"""
+        Answer the question using the context below.
+
+        Question:
+        {state['question']}
+
+        Context:
+        {context}
+        """
+
+        answer = llm.invoke(prompt).content
+        logger.info("synthesizer: done (answer_chars=%d)", len(answer or ""))
+
+        return {
+            **state,
+            "final_answer": answer
+        }
 
     tools_node = ToolNode([search_tool])
 
     g = StateGraph(AgentState)
+
     g.add_node("planner", planner)
     g.add_node("executor", executor)
-    g.add_node("tools", tools_node)
     g.add_node("synthesizer", synthesizer)
 
-    g.add_edge(START, "planner")
+    g.set_entry_point("planner")
+
     g.add_edge("planner", "executor")
-    g.add_conditional_edges("executor", tools_condition, {"tools": "tools", "__end__": "synthesizer"})
-    g.add_edge("tools", "executor")
+    g.add_conditional_edges("executor", should_continue)
     g.add_edge("synthesizer", END)
 
     graph = g.compile()
