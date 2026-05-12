@@ -7,6 +7,8 @@ from langchain_core.messages import AIMessage
 from local_agent import chat_agent, cli, vectorstore
 from local_agent.config import Settings
 
+# show top five most frequent Replication Server errors found in local documents
+# what are potential issues when compiling ganymed library
 
 class SmokeTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -54,8 +56,6 @@ class SmokeTest(unittest.TestCase):
             Document(page_content="second result", metadata={}),
         ]
         llm_instance = MagicMock()
-        llm_tools_instance = MagicMock()
-        llm_instance.bind_tools.return_value = llm_tools_instance
 
         captured_tool = {}
 
@@ -66,26 +66,24 @@ class SmokeTest(unittest.TestCase):
                 self.description = description
                 captured_tool["tool"] = self
 
-        def FakeToolNode(_tools):
-            # The graph won't route to tools in this test (no tool calls),
-            # but we need a valid node callable for compilation.
-            def _node(_state):
-                return {}
-
-            return _node
-
-        # planner + synthesizer calls
+        plan = (
+            "1) step one\n###\n"
+            "2) step two\n###\n"
+            "3) step three\n###\n"
+        )
+        # planner, three executor steps, synthesizer, critic (PASS)
         llm_instance.invoke.side_effect = [
-            AIMessage(content="- Search docs\n- Answer\n"),
+            AIMessage(content=plan),
+            AIMessage(content="(executor 1)"),
+            AIMessage(content="(executor 2)"),
+            AIMessage(content="(executor 3)"),
             AIMessage(content="Final answer"),
+            AIMessage(content="PASS"),
         ]
-        # executor call (no tool calls → goes straight to synthesizer)
-        llm_tools_instance.invoke.return_value = AIMessage(content="(executor step)")
 
         with (
             patch("local_agent.chat_agent.ChatOllama", return_value=llm_instance) as chat_ollama_mock,
             patch("local_agent.chat_agent.Tool", FakeTool),
-            patch("local_agent.chat_agent.ToolNode", FakeToolNode),
         ):
             created_agent = chat_agent.create_chat_agent(vectorstore_mock, self.settings)
 
@@ -103,9 +101,10 @@ class SmokeTest(unittest.TestCase):
         vectorstore_mock.similarity_search.assert_called_once_with("test query", k=3)
         self.assertEqual(tool_result, "first result\n\nsecond result")
 
-        # Ensure the resulting graph is invokable and returns messages.
+        # Ensure the resulting graph is invokable and returns agent state.
         result = created_agent.invoke({"input": "hello"})
-        self.assertIn("messages", result)
+        self.assertEqual(result.get("question"), "hello")
+        self.assertEqual(result.get("final_answer"), "Final answer")
 
     def test_get_or_create_vectorstore_uses_saved_index_when_docs_unchanged(self) -> None:
         embeddings = MagicMock()
