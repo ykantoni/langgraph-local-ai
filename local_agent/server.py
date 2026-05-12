@@ -138,9 +138,18 @@ def create_app() -> FastAPI:
                 super().__init__()
                 self._buf = ""
                 self._lock = threading.Lock()
+                self._cancel_raised = False
 
             def on_llm_new_token(self, token: str, **kwargs):  # type: ignore[override]
-                if cancel_event.is_set() or not token:
+                # If the client hit "Stop generating" (fetch aborted), the request disconnects
+                # and we set cancel_event. Raising here is the most reliable way to stop the
+                # underlying streaming LLM call and unwind the agent quickly.
+                if cancel_event.is_set():
+                    if not self._cancel_raised:
+                        self._cancel_raised = True
+                        raise RuntimeError("cancelled")
+                    return
+                if not token:
                     return
                 assistant_parts.append(token)
                 outgoing: list[str] = []
@@ -200,6 +209,8 @@ def create_app() -> FastAPI:
 
         def run_agent():
             try:
+                if cancel_event.is_set():
+                    return
                 # AgentExecutor is a Runnable; pass callbacks via config.
                 _agent.invoke({"input": user_input}, config={"callbacks": [handler]})
             except Exception as e:
@@ -222,6 +233,11 @@ def create_app() -> FastAPI:
                 try:
                     if await request.is_disconnected():
                         cancel_event.set()
+                        # Unblock SSE immediately even if the worker is still unwinding.
+                        try:
+                            token_q.put_nowait(None)
+                        except Exception:
+                            pass
                         return
                 except Exception:
                     # If disconnect detection fails, continue best-effort.

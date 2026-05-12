@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, TypedDict
 
+import re
+
 from langchain_core.tools import Tool
 from langchain_ollama import ChatOllama
 from langgraph.graph import END, StateGraph
@@ -20,6 +22,9 @@ class AgentState(TypedDict):
     current_step: int
     intermediate_results: list[str]
     final_answer: str
+    retrieval_query: str
+    critic_iters: int
+    critic_verdict: str
 
 
 @dataclass(frozen=True)
@@ -42,7 +47,10 @@ class LocalGraphAgent:
                 "plan": [],
                 "current_step": 0,
                 "intermediate_results": [],
-                "final_answer": ""
+                "final_answer": "",
+                "retrieval_query": "",
+                "critic_iters": 0,
+                "critic_verdict": "",
             },
             config=config,
         )
@@ -91,11 +99,36 @@ def create_chat_agent(vectorstore, settings: Settings) -> LocalGraphAgent:
             - summarize the information
             - combine the information
 
-            Return as a numbered list. Keep the plan short and concise.
+            Output exactly 3 steps in this EXACT format (including the ### lines):
+
+            1) <step text>
+            ###
+            2) <step text>
+            ###
+            3) <step text>
+            ###
+
+            Rules:
+            - The ONLY separator is a line containing exactly ### (three hash marks).
+            - There MUST be a ### line after step 1, after step 2, and after step 3.
+            - Do not add any extra text before 1) or after the last ###.
+            Keep the plan short and concise.
             """
         plan_text = llm.invoke(prompt).content
 
-        steps = [s.strip() for s in plan_text.split("\n") if s.strip()]
+        raw = (plan_text or "").strip()
+
+        # Primary parse: split on ### separators (works when ### appears after each step).
+        steps = [s.strip() for s in raw.split("###") if s.strip()]
+
+        # Fallback: if the model only put ### at the end, recover steps from a numbered list.
+        if len(steps) <= 1:
+            # Capture "1) ...", "2) ...", "3) ..." blocks even if they wrap lines.
+            matches = re.findall(r"(?ms)^\s*\d+\)\s*(.+?)(?=^\s*\d+\)\s*|\Z)", raw)
+            recovered = [m.strip() for m in matches if m.strip()]
+            if len(recovered) >= 2:
+                steps = recovered[:3]
+
         logger.info("planner: done (steps=%d plan_chars=%d)", len(steps), len(plan_text or ""))
 
         return {
@@ -103,12 +136,13 @@ def create_chat_agent(vectorstore, settings: Settings) -> LocalGraphAgent:
             "plan": steps,
             "current_step": 0,
             "intermediate_results": [],
+            "retrieval_query": "",
         }
 
     def retrieve(state: AgentState) -> AgentState:
-        """Always run local document search once after planning."""
-        q = state.get("question", "") or ""
-        logger.info("retrieve: start (question_chars=%d)", len(q))
+        """Always run local document search once after planning (or after critic revision)."""
+        q = (state.get("retrieval_query") or "").strip() or (state.get("question", "") or "")
+        logger.info("retrieve: start (query_chars=%d)", len(q))
         docs = search_docs(q)
         logger.info("retrieve: done (docs_chars=%d)", len(docs or ""))
         return {
@@ -163,8 +197,86 @@ def create_chat_agent(vectorstore, settings: Settings) -> LocalGraphAgent:
 
         return {
             **state,
-            "final_answer": answer
+            "final_answer": answer,
         }
+
+    def _parse_critic_output(raw: str) -> tuple[str, str]:
+        """Return (verdict 'PASS'|'REVISE', refined_search_query or '')."""
+        t = (raw or "").strip()
+        if not t:
+            return "PASS", ""
+        rq_m = re.search(r"(?im)^REFINED_QUERY:\s*(.+)$", t)
+        refined = rq_m.group(1).strip() if rq_m else ""
+        if re.search(r"(?im)^\s*PASS\s*$", t) or re.match(r"(?is)^\s*PASS\s*(\n|$)", t):
+            return "PASS", refined
+        if re.search(r"(?im)^\s*REVISE\s*:", t) or "REVISE:" in t.upper():
+            return "REVISE", refined
+        return "PASS", refined
+
+    def critic(state: AgentState) -> AgentState:
+        iters = int(state.get("critic_iters", 0) or 0)
+        if iters >= 2:
+            logger.info("critic: hard-stop (max revisions reached)")
+            return {**state, "critic_verdict": "PASS"}
+
+        answer = state.get("final_answer", "") or ""
+        question = state.get("question", "") or ""
+        context = "\n\n".join(state.get("intermediate_results") or [])
+
+        logger.info(
+            "critic: start (iters=%d answer_chars=%d)",
+            iters,
+            len(answer),
+        )
+
+        prompt = f"""You are a strict critic for the assistant's final answer.
+
+Question:
+{question}
+
+Retrieved / intermediate context (may be partial):
+{context[:8000]}
+
+Final answer:
+{answer}
+
+If the answer is adequate (grounded, complete enough for the question, clear), respond with exactly:
+PASS
+
+If the answer is weak (vague, missing key facts from context, or off-topic), respond with:
+REVISE: <one short paragraph: what is wrong and what to fix>
+
+Then on a new line:
+REFINED_QUERY: <a single line search query for local document search to gather better evidence>
+
+Do not include anything else outside this format."""
+
+        raw = llm.invoke(prompt).content
+        verdict, refined = _parse_critic_output(str(raw or ""))
+        logger.info(
+            "critic: done (verdict=%s refined_chars=%d)",
+            verdict,
+            len(refined),
+        )
+
+        if verdict == "PASS":
+            return {**state, "critic_verdict": "PASS"}
+
+        rq = refined.strip() or question
+        return {
+            **state,
+            "critic_verdict": "REVISE",
+            "critic_iters": iters + 1,
+            "retrieval_query": rq,
+            "intermediate_results": [],
+            "current_step": 0,
+        }
+
+    def route_after_critic(state: AgentState) -> str:
+        v = (state.get("critic_verdict") or "").strip()
+        if v == "PASS":
+            return END
+        return "retrieve"
 
     g = StateGraph(AgentState)
 
@@ -172,13 +284,19 @@ def create_chat_agent(vectorstore, settings: Settings) -> LocalGraphAgent:
     g.add_node("retrieve", retrieve)
     g.add_node("executor", executor)
     g.add_node("synthesizer", synthesizer)
+    g.add_node("critic", critic)
 
     g.set_entry_point("planner")
 
     g.add_edge("planner", "retrieve")
     g.add_edge("retrieve", "executor")
     g.add_conditional_edges("executor", should_continue)
-    g.add_edge("synthesizer", END)
+    g.add_edge("synthesizer", "critic")
+    g.add_conditional_edges(
+        "critic",
+        route_after_critic,
+        {END: END, "retrieve": "retrieve"},
+    )
 
     graph = g.compile()
     return LocalGraphAgent(graph=graph)
