@@ -24,6 +24,9 @@ class Settings:
     pdf_extractor: str
     pdf_cache_dir: str
     force_rebuild_index: bool
+    mcp_enabled: bool
+    mcp_servers_json: str
+    mcp_tool_search_name: str
 
     @property
     def faiss_index_file(self) -> str:
@@ -60,5 +63,8 @@ def load_settings() -> Settings:
         pdf_extractor=os.environ.get("PDF_EXTRACTOR", "auto").lower(),
         pdf_cache_dir=os.environ.get("PDF_CACHE_DIR", "./.pdf_text_cache"),
         force_rebuild_index=os.environ.get("FORCE_REBUILD_INDEX", "0") == "1",
+        mcp_enabled=os.environ.get("MCP_ENABLED", "0") == "1",
+        mcp_servers_json=os.environ.get("MCP_SERVERS_JSON", ""),
+        mcp_tool_search_name=os.environ.get("MCP_TOOL_SEARCH_NAME", "search_docs"),
     )
 

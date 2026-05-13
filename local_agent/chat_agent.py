@@ -1,19 +1,52 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, TypedDict
-
+import asyncio
+import concurrent.futures
+import logging
 import re
+from dataclasses import dataclass
+from typing import Any, Iterable, TypedDict
 
-from langchain_core.tools import Tool
+from langchain_core.tools import BaseTool, Tool
 from langchain_ollama import ChatOllama
 from langgraph.graph import END, StateGraph
-
-import logging
 
 from local_agent.config import Settings
 
 logger = logging.getLogger(__name__)
+
+
+def _run_tool_sync(tool: BaseTool, args: dict[str, Any] | str) -> str:
+    """Invoke a LangChain tool synchronously regardless of sync/async impl.
+
+    MCP-backed tools (``StructuredTool`` with only ``coroutine``) raise
+    ``NotImplementedError`` from ``invoke``; in that case we drive the async
+    path via ``asyncio.run``, isolating it to a worker thread if we happen to
+    be inside a running event loop.
+    """
+    try:
+        return str(tool.invoke(args))
+    except NotImplementedError:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return str(asyncio.run(tool.ainvoke(args)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            return str(ex.submit(asyncio.run, tool.ainvoke(args)).result())
+
+
+def _find_tool(tools: Iterable[BaseTool], name: str) -> BaseTool | None:
+    target = (name or "").strip()
+    if not target:
+        return None
+    for t in tools:
+        if t.name == target:
+            return t
+    # Best-effort match by suffix to tolerate "<server>_search_docs" prefixing.
+    for t in tools:
+        if t.name.endswith("_" + target) or t.name.endswith(target):
+            return t
+    return None
 
 
 class AgentState(TypedDict):
@@ -62,7 +95,20 @@ class LocalGraphAgent:
         return messages
 
 
-def create_chat_agent(vectorstore, settings: Settings) -> LocalGraphAgent:
+def create_chat_agent(
+    vectorstore,
+    settings: Settings,
+    tools: list[BaseTool] | None = None,
+    tools_supported: bool = False,
+) -> LocalGraphAgent:
+    """Build the planner / retrieve / executor / synthesizer / critic graph.
+
+    ``tools`` are external LangChain tools (typically loaded from MCP servers).
+    When ``tools_supported`` is true AND ``tools`` is non-empty, the ``retrieve``
+    node asks the LLM to choose and invoke one of those tools (tool-calling
+    path). Otherwise it falls back to the original behaviour of calling FAISS
+    similarity search on ``vectorstore`` directly (direct-retrieval path).
+    """
 
     def search_docs(query: str) -> str:
         logger.info("search_docs: start (query_chars=%d)", len(query or ""))
@@ -75,6 +121,8 @@ def create_chat_agent(vectorstore, settings: Settings) -> LocalGraphAgent:
         )
         return out
 
+    # Always create the in-process local-search Tool so the fallback path (and
+    # backwards-compatible tests) keep working even when MCP is disabled.
     search_tool = Tool(
         name="LocalDocumentSearch",
         func=search_docs,
@@ -87,6 +135,29 @@ def create_chat_agent(vectorstore, settings: Settings) -> LocalGraphAgent:
         base_url=settings.ollama_base_url,
         streaming=True,
     )
+
+    use_tool_calling = bool(tools_supported and tools)
+    llm_with_tools = None
+    if use_tool_calling:
+        try:
+            llm_with_tools = llm.bind_tools(list(tools))
+            logger.info(
+                "chat_agent: tool-calling enabled (tools=%s)",
+                [t.name for t in tools],
+            )
+        except Exception as e:
+            logger.warning(
+                "chat_agent: bind_tools failed (%s); falling back to direct retrieval",
+                e,
+            )
+            use_tool_calling = False
+            llm_with_tools = None
+    else:
+        logger.info(
+            "chat_agent: tool-calling disabled (tools_supported=%s tools_count=%d) — using direct retrieval",
+            tools_supported,
+            len(tools or []),
+        )
 
     def planner(state: AgentState) -> AgentState:
         logger.info("planner: start (question_chars=%d)", len(state.get("question", "") or ""))
@@ -139,16 +210,79 @@ def create_chat_agent(vectorstore, settings: Settings) -> LocalGraphAgent:
             "retrieval_query": "",
         }
 
-    def retrieve(state: AgentState) -> AgentState:
-        """Always run local document search once after planning (or after critic revision)."""
+    def retrieve_direct(state: AgentState) -> AgentState:
+        """Run local document search once after planning (or after critic revision)."""
         q = (state.get("retrieval_query") or "").strip() or (state.get("question", "") or "")
-        logger.info("retrieve: start (query_chars=%d)", len(q))
+        logger.info("retrieve(direct): start (query_chars=%d)", len(q))
         docs = search_docs(q)
-        logger.info("retrieve: done (docs_chars=%d)", len(docs or ""))
+        logger.info("retrieve(direct): done (docs_chars=%d)", len(docs or ""))
         return {
             **state,
             "intermediate_results": (state.get("intermediate_results") or []) + [docs],
         }
+
+    def retrieve_via_tools(state: AgentState) -> AgentState:
+        """Ask the tool-capable LLM to call one of the available MCP tools.
+
+        On any failure (no tool call returned, unknown tool name, runtime
+        error from the tool), we fall back to in-process FAISS search so the
+        critic loop still has evidence to work with.
+        """
+        q = (state.get("retrieval_query") or "").strip() or (state.get("question", "") or "")
+        logger.info("retrieve(tools): start (query_chars=%d)", len(q))
+
+        tool_names = ", ".join(t.name for t in (tools or []))
+        prompt = (
+            "You have access to the following tools that can search local "
+            f"project documents: {tool_names}.\n\n"
+            "Decide which single tool to call and invoke it with the most "
+            "appropriate search query for the user's question. "
+            "Do not answer directly; only call the tool.\n\n"
+            f"User question / refined query:\n{q}"
+        )
+
+        outputs: list[str] = []
+        try:
+            assert llm_with_tools is not None  # guarded by use_tool_calling
+            msg = llm_with_tools.invoke(prompt)
+            tool_calls = list(getattr(msg, "tool_calls", None) or [])
+            logger.info("retrieve(tools): llm produced %d tool_call(s)", len(tool_calls))
+
+            for tc in tool_calls:
+                name = (tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")) or ""
+                args = (tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})) or {}
+                if isinstance(args, str):
+                    args = {"query": args}
+                if "query" not in args and q:
+                    args.setdefault("query", q)
+                target = _find_tool(tools or [], name)
+                if target is None:
+                    logger.warning("retrieve(tools): unknown tool name %r", name)
+                    continue
+                try:
+                    out = _run_tool_sync(target, args)
+                    if out:
+                        outputs.append(out)
+                except Exception as e:
+                    logger.warning("retrieve(tools): tool %r raised: %s", target.name, e)
+        except Exception as e:
+            logger.warning("retrieve(tools): llm tool-call failed (%s); using direct search", e)
+
+        if not outputs:
+            logger.info("retrieve(tools): no tool output, falling back to direct search")
+            outputs.append(search_docs(q))
+
+        logger.info(
+            "retrieve(tools): done (chunks=%d total_chars=%d)",
+            len(outputs),
+            sum(len(o or "") for o in outputs),
+        )
+        return {
+            **state,
+            "intermediate_results": (state.get("intermediate_results") or []) + outputs,
+        }
+
+    retrieve = retrieve_via_tools if use_tool_calling else retrieve_direct
 
     def executor(state: AgentState) -> AgentState:
         step_idx = int(state.get("current_step", 0) or 0)

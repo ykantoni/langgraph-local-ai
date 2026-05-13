@@ -39,6 +39,9 @@ def _minimal_settings(**overrides) -> Settings:
         pdf_extractor="auto",
         pdf_cache_dir="/tmp/pdf_cache",
         force_rebuild_index=False,
+        mcp_enabled=False,
+        mcp_servers_json="",
+        mcp_tool_search_name="search_docs",
     )
     base.update(overrides)
     return Settings(**base)
@@ -246,6 +249,8 @@ class TestRuntime(unittest.TestCase):
         _args, kwargs = bc.call_args
         self.assertEqual(kwargs["level"], logging.INFO)
 
+    @patch("local_agent.runtime.model_supports_tools")
+    @patch("local_agent.runtime.load_mcp_tools")
     @patch("local_agent.runtime.create_chat_agent")
     @patch("local_agent.runtime.get_or_create_vectorstore")
     @patch("local_agent.runtime.SentenceTransformerEmbeddings")
@@ -258,6 +263,8 @@ class TestRuntime(unittest.TestCase):
         mock_st: MagicMock,
         mock_vs: MagicMock,
         mock_create: MagicMock,
+        mock_load_mcp: MagicMock,
+        mock_supports: MagicMock,
     ) -> None:
         settings = _minimal_settings(st_embed_model="m", st_encode_batch=16, st_device="cpu")
         mock_load_settings.return_value = settings
@@ -267,6 +274,8 @@ class TestRuntime(unittest.TestCase):
         mock_vs.return_value = vs
         agent = object()
         mock_create.return_value = agent
+        mock_load_mcp.return_value = []
+        mock_supports.return_value = False
 
         out_agent, out_settings = runtime.load_chat_agent()
 
@@ -280,7 +289,111 @@ class TestRuntime(unittest.TestCase):
             device=settings.st_device,
         )
         mock_vs.assert_called_once_with(settings, emb)
-        mock_create.assert_called_once_with(vs, settings)
+        mock_create.assert_called_once_with(
+            vs, settings, tools=[], tools_supported=False
+        )
+        # Empty tools list short-circuits the capability probe.
+        mock_supports.assert_not_called()
+
+    @patch("local_agent.runtime.model_supports_tools")
+    @patch("local_agent.runtime.load_mcp_tools")
+    @patch("local_agent.runtime.create_chat_agent")
+    @patch("local_agent.runtime.get_or_create_vectorstore")
+    @patch("local_agent.runtime.SentenceTransformerEmbeddings")
+    @patch("local_agent.runtime.setup_logging")
+    @patch("local_agent.runtime.load_settings")
+    def test_load_chat_agent_with_mcp_tools_and_supported_model(
+        self,
+        mock_load_settings: MagicMock,
+        _setup_logging: MagicMock,
+        _st: MagicMock,
+        _vs_factory: MagicMock,
+        mock_create: MagicMock,
+        mock_load_mcp: MagicMock,
+        mock_supports: MagicMock,
+    ) -> None:
+        settings = _minimal_settings(mcp_enabled=True, mcp_servers_json='{"x":{}}')
+        mock_load_settings.return_value = settings
+        tool_a = MagicMock()
+        tool_a.name = "search_docs"
+        mock_load_mcp.return_value = [tool_a]
+        mock_supports.return_value = True
+
+        runtime.load_chat_agent()
+
+        mock_load_mcp.assert_called_once_with(settings)
+        mock_supports.assert_called_once_with(
+            settings.ollama_base_url, settings.ollama_chat_model
+        )
+        _, kwargs = mock_create.call_args
+        self.assertEqual(kwargs["tools"], [tool_a])
+        self.assertTrue(kwargs["tools_supported"])
+
+    def test_load_mcp_tools_disabled_returns_empty(self) -> None:
+        settings = _minimal_settings(mcp_enabled=False, mcp_servers_json='{"x":{}}')
+        self.assertEqual(runtime.load_mcp_tools(settings), [])
+
+    def test_load_mcp_tools_invalid_json_returns_empty(self) -> None:
+        settings = _minimal_settings(mcp_enabled=True, mcp_servers_json="not-json")
+        self.assertEqual(runtime.load_mcp_tools(settings), [])
+
+    def test_load_mcp_tools_empty_object_returns_empty(self) -> None:
+        settings = _minimal_settings(mcp_enabled=True, mcp_servers_json="{}")
+        self.assertEqual(runtime.load_mcp_tools(settings), [])
+
+    def test_load_mcp_tools_happy_path(self) -> None:
+        settings = _minimal_settings(
+            mcp_enabled=True,
+            mcp_servers_json='{"docs": {"command": "x", "args": [], "transport": "stdio"}}',
+        )
+        fake_tool = MagicMock()
+        fake_tool.name = "search_docs"
+        fake_client = MagicMock()
+
+        async def _get_tools():
+            return [fake_tool]
+
+        fake_client.get_tools.side_effect = _get_tools
+        with patch(
+            "langchain_mcp_adapters.client.MultiServerMCPClient",
+            return_value=fake_client,
+        ) as ctor:
+            tools = runtime.load_mcp_tools(settings)
+        self.assertEqual(tools, [fake_tool])
+        ctor.assert_called_once_with(
+            {"docs": {"command": "x", "args": [], "transport": "stdio"}}
+        )
+
+    def test_model_supports_tools_returns_true_when_capability_present(self) -> None:
+        class FakeResp:
+            def __init__(self, payload: bytes) -> None:
+                self._payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a):
+                return False
+
+            def read(self) -> bytes:
+                return self._payload
+
+        payload = b'{"capabilities": ["completion", "tools"]}'
+        with patch("urllib.request.urlopen", return_value=FakeResp(payload)):
+            self.assertTrue(
+                runtime.model_supports_tools("http://localhost:11434", "granite3.3")
+            )
+
+    def test_model_supports_tools_returns_false_on_network_error(self) -> None:
+        import urllib.error
+
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=urllib.error.URLError("boom"),
+        ):
+            self.assertFalse(
+                runtime.model_supports_tools("http://localhost:11434", "granite3.3")
+            )
 
 
 class TestCli(unittest.TestCase):

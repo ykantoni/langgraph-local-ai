@@ -33,6 +33,9 @@ class SmokeTest(unittest.TestCase):
             pdf_extractor="auto",
             pdf_cache_dir="C:/tmp/pdf_cache",
             force_rebuild_index=False,
+            mcp_enabled=False,
+            mcp_servers_json="",
+            mcp_tool_search_name="search_docs",
         )
 
     def test_cli_main_wires_components_and_exits_without_running_agent(self) -> None:
@@ -104,6 +107,102 @@ class SmokeTest(unittest.TestCase):
         # Ensure the resulting graph is invokable and returns agent state.
         result = created_agent.invoke({"input": "hello"})
         self.assertEqual(result.get("question"), "hello")
+        self.assertEqual(result.get("final_answer"), "Final answer")
+
+    def test_create_chat_agent_tool_calling_path_invokes_mcp_tool(self) -> None:
+        vectorstore_mock = MagicMock()
+        vectorstore_mock.similarity_search.return_value = [
+            Document(page_content="fallback only", metadata={}),
+        ]
+
+        mcp_tool = MagicMock()
+        mcp_tool.name = "search_docs"
+        mcp_tool.invoke.return_value = "MCP TOOL RESULT"
+
+        llm_instance = MagicMock()
+        bound_llm = MagicMock()
+        llm_instance.bind_tools.return_value = bound_llm
+
+        plan = (
+            "1) step one\n###\n"
+            "2) step two\n###\n"
+            "3) step three\n###\n"
+        )
+        # planner, bound retrieve, 3 executors, synthesizer, critic (PASS)
+        llm_instance.invoke.side_effect = [
+            AIMessage(content=plan),
+            AIMessage(content="(executor 1)"),
+            AIMessage(content="(executor 2)"),
+            AIMessage(content="(executor 3)"),
+            AIMessage(content="Final answer"),
+            AIMessage(content="PASS"),
+        ]
+        bound_llm.invoke.return_value = AIMessage(
+            content="",
+            tool_calls=[
+                {"id": "1", "name": "search_docs", "args": {"query": "hello"}},
+            ],
+        )
+
+        with patch("local_agent.chat_agent.ChatOllama", return_value=llm_instance):
+            created_agent = chat_agent.create_chat_agent(
+                vectorstore_mock,
+                self.settings,
+                tools=[mcp_tool],
+                tools_supported=True,
+            )
+
+        result = created_agent.invoke({"input": "hello"})
+
+        llm_instance.bind_tools.assert_called_once_with([mcp_tool])
+        bound_llm.invoke.assert_called_once()
+        mcp_tool.invoke.assert_called_once()
+        # MCP tool output should land in intermediate_results (in addition to executor outputs).
+        self.assertIn("MCP TOOL RESULT", result.get("intermediate_results"))
+        # Fallback FAISS path must NOT be hit when the MCP tool returns content.
+        vectorstore_mock.similarity_search.assert_not_called()
+        self.assertEqual(result.get("final_answer"), "Final answer")
+
+    def test_create_chat_agent_falls_back_when_bind_tools_unsupported(self) -> None:
+        """If bind_tools raises (model doesn't actually support tools), use direct retrieval."""
+        vectorstore_mock = MagicMock()
+        vectorstore_mock.similarity_search.return_value = [
+            Document(page_content="local search result", metadata={}),
+        ]
+
+        mcp_tool = MagicMock()
+        mcp_tool.name = "search_docs"
+
+        llm_instance = MagicMock()
+        llm_instance.bind_tools.side_effect = NotImplementedError("no tools")
+
+        plan = (
+            "1) step one\n###\n"
+            "2) step two\n###\n"
+            "3) step three\n###\n"
+        )
+        llm_instance.invoke.side_effect = [
+            AIMessage(content=plan),
+            AIMessage(content="(executor 1)"),
+            AIMessage(content="(executor 2)"),
+            AIMessage(content="(executor 3)"),
+            AIMessage(content="Final answer"),
+            AIMessage(content="PASS"),
+        ]
+
+        with patch("local_agent.chat_agent.ChatOllama", return_value=llm_instance):
+            created_agent = chat_agent.create_chat_agent(
+                vectorstore_mock,
+                self.settings,
+                tools=[mcp_tool],
+                tools_supported=True,
+            )
+
+        result = created_agent.invoke({"input": "hello"})
+
+        mcp_tool.invoke.assert_not_called()
+        vectorstore_mock.similarity_search.assert_called_once_with("hello", k=3)
+        self.assertIn("local search result", result.get("intermediate_results"))
         self.assertEqual(result.get("final_answer"), "Final answer")
 
     def test_get_or_create_vectorstore_uses_saved_index_when_docs_unchanged(self) -> None:
