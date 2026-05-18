@@ -1,10 +1,26 @@
+"""Vector-store benchmarks (FAISS, Chroma, pgvector).
+
+Install deps:  pip install -r requirements.txt
+"""
+
 import os
+import subprocess
 import time
 import shutil
+from urllib.parse import urlparse
+
 import numpy as np
 import chromadb
 import faiss
 from tqdm import tqdm
+
+try:
+    import psycopg
+    from pgvector.psycopg import register_vector
+
+    _PGVECTOR_AVAILABLE = True
+except ImportError:
+    _PGVECTOR_AVAILABLE = False
 
 # -----------------------------
 # CONFIG
@@ -18,6 +34,70 @@ TOP_K = 5
 
 FAISS_INDEX_PATH = "./artifacts/faiss_index.bin"
 CHROMA_PERSIST_DIR = "./chroma_data"
+PGVECTOR_TABLE = "bench_pgvector"
+# postgresql://user:pass@host:port/dbname  (requires CREATE EXTENSION vector)
+PGVECTOR_DSN = os.environ.get(
+    "PGVECTOR_DSN",
+    "postgresql://postgres:postgres@127.0.0.1:5432/postgres",
+)
+
+
+def _pgvector_open_connection() -> tuple[object, subprocess.Popen | None, str]:
+    """Connect to Postgres for the pgvector benchmark.
+
+  Use ``PGVECTOR_DSN`` with the node INTERNAL-IP and NodePort from
+  ``kubectl get svc pgvector-bench -n pgvector-bench``. Or set
+  ``PGVECTOR_KUBECTL_PORT_FORWARD=1`` for ``kubectl port-forward``.
+    """
+    use_pf = os.environ.get("PGVECTOR_KUBECTL_PORT_FORWARD", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    pf_proc: subprocess.Popen | None = None
+    dsn = PGVECTOR_DSN
+
+    if use_pf:
+        local_port = int(os.environ.get("PGVECTOR_LOCAL_PORT", "5432"))
+        ns = os.environ.get("PGVECTOR_PORT_FORWARD_NS", "pgvector-bench")
+        svc = os.environ.get("PGVECTOR_PORT_FORWARD_SVC", "pgvector-bench")
+        parsed = urlparse(PGVECTOR_DSN)
+        user = parsed.username or "postgres"
+        password = parsed.password or "postgres"
+        dbname = (parsed.path or "/postgres").lstrip("/") or "postgres"
+        dsn = f"postgresql://{user}:{password}@127.0.0.1:{local_port}/{dbname}"
+        pf_proc = subprocess.Popen(
+            ["kubectl", "port-forward", "-n", ns, f"svc/{svc}", f"{local_port}:5432"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        print(
+            f"pgvector: kubectl port-forward svc/{svc} -> 127.0.0.1:{local_port} "
+            f"(pid {pf_proc.pid})"
+        )
+
+    timeout = int(os.environ.get("PGVECTOR_CONNECT_TIMEOUT", "10"))
+
+    deadline = time.time() + max(timeout, 15)
+    last_err: Exception | None = None
+    while time.time() < deadline:
+        if pf_proc is not None and pf_proc.poll() is not None:
+            err = (pf_proc.stderr.read() if pf_proc.stderr else b"").decode(
+                "utf-8", errors="replace"
+            )
+            raise RuntimeError(f"kubectl port-forward exited early: {err or pf_proc.returncode}")
+        try:
+            conn = psycopg.connect(dsn, autocommit=False, connect_timeout=min(5, timeout))
+            return conn, pf_proc, dsn
+        except Exception as e:
+            last_err = e
+            time.sleep(0.5)
+
+    if pf_proc is not None:
+        pf_proc.terminate()
+    assert last_err is not None
+    raise last_err
+
 
 # -----------------------------
 # GENERATE DATA
@@ -70,6 +150,116 @@ print(f"Avg query latency: {faiss_latency*1000:.2f} ms")
 print(f"QPS: {NQ / faiss_query_time:.2f}")
 
 # =============================
+# PGVECTOR BENCHMARK
+# =============================
+# Requires Postgres with the pgvector extension, e.g.:
+#   kubectl apply -f deploy/pgvector/postgres.yaml
+#   kubectl get nodes -o wide && kubectl get svc pgvector-bench -n pgvector-bench
+# NodePort from host: postgresql://postgres:postgres@<NODE_IP>:<NODE_PORT>/postgres
+# Or: PGVECTOR_KUBECTL_PORT_FORWARD=1 with PGVECTOR_DSN (uses kubectl port-forward to 127.0.0.1)
+print("\n--- pgvector (PostgreSQL) ---")
+
+pg_index_time = None
+pg_save_time = None
+pg_load_time = None
+pg_query_time = None
+pg_latency = None
+pg_skipped = False
+
+if not _PGVECTOR_AVAILABLE:
+    print("Skipped: install psycopg and pgvector (pip install -r requirements.txt)")
+    pg_skipped = True
+else:
+    pf_proc: subprocess.Popen | None = None
+    pg_dsn = PGVECTOR_DSN
+    try:
+        conn, pf_proc, pg_dsn = _pgvector_open_connection()
+
+        with conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        conn.commit()
+        register_vector(conn)
+
+        with conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS {PGVECTOR_TABLE}")
+            cur.execute(
+                f"CREATE TABLE {PGVECTOR_TABLE} ("
+                "id int PRIMARY KEY, "
+                f"embedding vector({DIM})"
+                ")"
+            )
+        conn.commit()
+
+        start = time.time()
+        batch_size = 1000
+        with conn.cursor() as cur:
+            for i in tqdm(range(0, N, batch_size), desc="pgvector insert"):
+                end = min(i + batch_size, N)
+                rows = [(j, xb[j]) for j in range(i, end)]
+                cur.executemany(
+                    f"INSERT INTO {PGVECTOR_TABLE} (id, embedding) VALUES (%s, %s)",
+                    rows,
+                )
+            cur.execute(
+                f"CREATE INDEX {PGVECTOR_TABLE}_hnsw "
+                f"ON {PGVECTOR_TABLE} USING hnsw (embedding vector_l2_ops)"
+            )
+        conn.commit()
+        pg_index_time = time.time() - start
+        print(f"Indexing time (insert + HNSW): {pg_index_time:.2f}s")
+
+        start = time.time()
+        conn.commit()
+        pg_save_time = time.time() - start
+        print(f"Commit / persist: {pg_save_time:.4f}s")
+
+        conn.close()
+        start = time.time()
+        conn_loaded = psycopg.connect(
+            pg_dsn,
+            autocommit=False,
+            connect_timeout=int(os.environ.get("PGVECTOR_CONNECT_TIMEOUT", "10")),
+        )
+        with conn_loaded.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        conn_loaded.commit()
+        register_vector(conn_loaded)
+        with conn_loaded.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM {PGVECTOR_TABLE}")
+            row_count = cur.fetchone()[0]
+        pg_load_time = time.time() - start
+        print(f"Load time (reconnect): {pg_load_time:.2f}s ({row_count:,} rows)")
+
+        start = time.time()
+        with conn_loaded.cursor() as cur:
+            for q in xq:
+                cur.execute(
+                    f"SELECT id FROM {PGVECTOR_TABLE} "
+                    "ORDER BY embedding <-> %s LIMIT %s",
+                    (q, TOP_K),
+                )
+                cur.fetchall()
+        pg_query_time = time.time() - start
+        conn_loaded.close()
+
+        pg_latency = pg_query_time / NQ
+        print(f"Avg query latency: {pg_latency * 1000:.2f} ms")
+        print(f"QPS: {NQ / pg_query_time:.2f}")
+
+    except Exception as e:
+        print(f"Skipped: {e}")
+        print(f"  DSN: {pg_dsn}")
+        if "timeout" in str(e).lower():
+            print(
+                "  Hint: use node IP + NodePort from kubectl get nodes/svc, or "
+                "set PGVECTOR_KUBECTL_PORT_FORWARD=1 for port-forward to 127.0.0.1."
+            )
+        pg_skipped = True
+    finally:
+        if pf_proc is not None:
+            pf_proc.terminate()
+            
+# =============================
 # CHROMA BENCHMARK
 # =============================
 print("\n--- Chroma ---")
@@ -119,6 +309,7 @@ chroma_latency = chroma_query_time / NQ
 print(f"Avg query latency: {chroma_latency*1000:.2f} ms")
 print(f"QPS: {NQ / chroma_query_time:.2f}")
 
+
 # =============================
 # SUMMARY
 # =============================
@@ -129,3 +320,9 @@ print(f"  → query latency: {faiss_latency*1000:.2f} ms | QPS: {NQ / faiss_quer
 print(f"\nChroma")
 print(f"  → index: {chroma_index_time:.2f}s | persist: {chroma_save_time:.2f}s | load: {chroma_load_time:.2f}s")
 print(f"  → query latency: {chroma_latency*1000:.2f} ms | QPS: {NQ / chroma_query_time:.2f}")
+if not pg_skipped and pg_index_time is not None:
+    print(f"\npgvector (HNSW, L2)")
+    print(f"  → index: {pg_index_time:.2f}s | commit: {pg_save_time:.4f}s | load: {pg_load_time:.2f}s")
+    print(f"  → query latency: {pg_latency * 1000:.2f} ms | QPS: {NQ / pg_query_time:.2f}")
+else:
+    print("\npgvector: skipped (see section above)")

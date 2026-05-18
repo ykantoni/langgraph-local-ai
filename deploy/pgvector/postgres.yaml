@@ -1,0 +1,156 @@
+# Postgres + pgvector for benchmark.py (100k-vector workload).
+#
+# Deploy (default StorageClass required):
+#   kubectl apply -f deploy/pgvector/postgres.yaml
+#   kubectl wait --for=condition=available deployment/pgvector-bench -n pgvector-bench --timeout=300s
+#   kubectl get nodes -o wide
+#   kubectl get svc pgvector-bench -n pgvector-bench
+#
+# From outside the cluster (NodePort): use NODE_INTERNAL-IP and the port in 5432:NODEPORT/TCP:
+#   set PGVECTOR_DSN=postgresql://postgres:postgres@172.19.73.182:32381/postgres
+#   python benchmark.py
+#
+# In-cluster: use the Service DNS name on port 5432:
+#   psql -h pgvector-bench -U postgres -d postgres -c "SELECT 1;"
+#
+# Optional: kubectl port-forward -n pgvector-bench svc/pgvector-bench 5432:5432
+#   then PGVECTOR_DSN=@127.0.0.1:5432/postgres
+#
+# If the pod logs show: chmod/initdb ... '/var/lib/postgresql/data': Operation not permitted
+# - Do NOT set container securityContext.runAsUser/runAsGroup for the main postgres
+#   container. The official postgres entrypoint must run as root first to chown/chmod
+#   PGDATA on the PVC; forcing UID 999 makes initdb fail with EPERM on many storage
+#   backends. Pod-level fsGroup: 999 is enough for group-writable volumes after chown.
+# - For clusters that forbid root containers, use an initContainer (runAsUser: 0) to
+#   chown the volume, then run postgres with runAsNonRoot — not included here by default.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pgvector-bench
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pgvector-bench-credentials
+  namespace: pgvector-bench
+type: Opaque
+stringData:
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: postgres
+  POSTGRES_DB: postgres
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: postgres-pv
+spec:
+  capacity:
+    storage: 5Gi
+  volumeMode: Filesystem
+  accessModes:
+  - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: local-storage
+  local:
+    path: /mnt/kubehome/postgres
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: In
+          values:
+          - titan
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pgvector-bench-data
+  namespace: pgvector-bench
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-storage
+  volumeName: postgres-pv
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgvector-bench
+  namespace: pgvector-bench
+  labels:
+    app: pgvector-bench
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pgvector-bench
+  template:
+    metadata:
+      labels:
+        app: pgvector-bench
+    spec:
+      # After the entrypoint chowns PGDATA, files are owned by postgres (999).
+      # fsGroup lets the kubelet apply supplemental group 999 on the volume mount.
+      securityContext:
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:pg16
+          ports:
+            - containerPort: 5432
+              name: postgres
+          envFrom:
+            - secretRef:
+                name: pgvector-bench-credentials
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - postgres
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - postgres
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pgvector-bench-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pgvector-bench
+  namespace: pgvector-bench
+  labels:
+    app: pgvector-bench
+spec:
+  type: NodePort
+  selector:
+    app: pgvector-bench
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      # nodePort omitted — Kubernetes assigns 30000–32767; read with kubectl get svc

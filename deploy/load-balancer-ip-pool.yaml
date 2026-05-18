@@ -1,0 +1,18 @@
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: docker-desktop-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    # CHANGE to match your node's subnet (see kubectl get nodes -o wide)
+    - 192.168.65.200-192.168.65.250
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: docker-desktop-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - docker-desktop-pool
