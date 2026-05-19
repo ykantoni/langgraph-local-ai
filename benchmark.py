@@ -1,4 +1,4 @@
-"""Vector-store benchmarks (FAISS, Chroma, pgvector).
+"""Vector-store benchmarks (FAISS, Chroma, pgvector, Qdrant).
 
 Install deps:  pip install -r requirements.txt
 """
@@ -22,6 +22,14 @@ try:
 except ImportError:
     _PGVECTOR_AVAILABLE = False
 
+try:
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import Distance, PointStruct, VectorParams
+
+    _QDRANT_AVAILABLE = True
+except ImportError:
+    _QDRANT_AVAILABLE = False
+
 # -----------------------------
 # CONFIG
 # -----------------------------
@@ -34,6 +42,12 @@ TOP_K = 5
 
 FAISS_INDEX_PATH = "./artifacts/faiss_index.bin"
 CHROMA_PERSIST_DIR = "./chroma_data"
+CHROMA_HOST = os.environ.get("CHROMA_HOST", "").strip()
+CHROMA_PORT = int(os.environ.get("CHROMA_PORT", "8000"))
+CHROMA_COLLECTION = os.environ.get("CHROMA_COLLECTION", "bench")
+QDRANT_PATH = os.environ.get("QDRANT_PATH", "./qdrant_data")
+QDRANT_URL = os.environ.get("QDRANT_URL", "").strip()
+QDRANT_COLLECTION = os.environ.get("QDRANT_COLLECTION", "bench")
 PGVECTOR_TABLE = "bench_pgvector"
 # postgresql://user:pass@host:port/dbname  (requires CREATE EXTENSION vector)
 PGVECTOR_DSN = os.environ.get(
@@ -99,6 +113,35 @@ def _pgvector_open_connection() -> tuple[object, subprocess.Popen | None, str]:
     raise last_err
 
 
+def _chroma_client():
+    if CHROMA_HOST:
+        return chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
+    return chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+
+
+def _chroma_reset_collection(client) -> None:
+    try:
+        client.delete_collection(CHROMA_COLLECTION)
+    except Exception:
+        pass
+    client.create_collection(CHROMA_COLLECTION)
+
+
+def _qdrant_client() -> "QdrantClient":
+    if QDRANT_URL:
+        return QdrantClient(url=QDRANT_URL)
+    return QdrantClient(path=QDRANT_PATH)
+
+
+def _qdrant_reset_collection(client: "QdrantClient") -> None:
+    if client.collection_exists(QDRANT_COLLECTION):
+        client.delete_collection(QDRANT_COLLECTION)
+    client.create_collection(
+        collection_name=QDRANT_COLLECTION,
+        vectors_config=VectorParams(size=DIM, distance=Distance.EUCLID),
+    )
+
+
 # -----------------------------
 # GENERATE DATA
 # -----------------------------
@@ -148,6 +191,79 @@ faiss_latency = faiss_query_time / NQ
 
 print(f"Avg query latency: {faiss_latency*1000:.2f} ms")
 print(f"QPS: {NQ / faiss_query_time:.2f}")
+
+# =============================
+# QDRANT BENCHMARK
+# =============================
+# Local disk: default QDRANT_PATH=./qdrant_data
+# Kubernetes: kubectl apply -f deploy/qdrant/qdrant.yaml
+#   set QDRANT_URL=http://<NODE_IP>:<NODE_PORT>   # from kubectl get svc -n qdrant-bench
+# Or:         set QDRANT_URL=http://127.0.0.1:6333  (kubectl port-forward ... 6333:6333)
+print("\n--- Qdrant ---")
+
+qdrant_index_time = None
+qdrant_save_time = None
+qdrant_load_time = None
+qdrant_query_time = None
+qdrant_latency = None
+qdrant_skipped = False
+
+if not _QDRANT_AVAILABLE:
+    print("Skipped: install qdrant-client (pip install -r requirements.txt)")
+    qdrant_skipped = True
+else:
+    try:
+        if not QDRANT_URL and os.path.exists(QDRANT_PATH):
+            shutil.rmtree(QDRANT_PATH)
+
+        client = _qdrant_client()
+        _qdrant_reset_collection(client)
+
+        start = time.time()
+        batch_size = 1000
+        for i in tqdm(range(0, N, batch_size), desc="qdrant upsert"):
+            end = min(i + batch_size, N)
+            points = [
+                PointStruct(id=j, vector=xb[j].tolist())
+                for j in range(i, end)
+            ]
+            client.upsert(collection_name=QDRANT_COLLECTION, points=points)
+        qdrant_index_time = time.time() - start
+        print(f"Indexing time: {qdrant_index_time:.2f}s")
+
+        start = time.time()
+        _ = _qdrant_client()
+        qdrant_save_time = time.time() - start
+        mode = QDRANT_URL or f"path={QDRANT_PATH}"
+        print(f"Persist / reopen ({mode}): {qdrant_save_time:.2f}s")
+
+        start = time.time()
+        client_loaded = _qdrant_client()
+        row_count = client_loaded.count(
+            collection_name=QDRANT_COLLECTION, exact=True
+        ).count
+        qdrant_load_time = time.time() - start
+        print(f"Load time: {qdrant_load_time:.2f}s ({row_count:,} points)")
+
+        start = time.time()
+        for q in xq:
+            client_loaded.query_points(
+                collection_name=QDRANT_COLLECTION,
+                query=q.tolist(),
+                limit=TOP_K,
+            )
+        qdrant_query_time = time.time() - start
+        qdrant_latency = qdrant_query_time / NQ
+        print(f"Avg query latency: {qdrant_latency * 1000:.2f} ms")
+        print(f"QPS: {NQ / qdrant_query_time:.2f}")
+
+    except Exception as e:
+        print(f"Skipped: {e}")
+        if QDRANT_URL:
+            print(f"  URL: {QDRANT_URL}")
+        else:
+            print(f"  path: {QDRANT_PATH}")
+        qdrant_skipped = True
 
 # =============================
 # PGVECTOR BENCHMARK
@@ -258,19 +374,21 @@ else:
     finally:
         if pf_proc is not None:
             pf_proc.terminate()
-            
+
 # =============================
 # CHROMA BENCHMARK
 # =============================
+# Local: default ./chroma_data (PersistentClient)
+# Kubernetes: kubectl apply -f deploy/chroma/chroma.yaml
+#   set CHROMA_HOST=<NODE_IP>  set CHROMA_PORT=<NODE_PORT>
 print("\n--- Chroma ---")
 
-# Clean up any previous chroma persistent directory
-if os.path.exists(CHROMA_PERSIST_DIR):
+if not CHROMA_HOST and os.path.exists(CHROMA_PERSIST_DIR):
     shutil.rmtree(CHROMA_PERSIST_DIR)
 
-# Create persistent client
-client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
-collection = client.create_collection("bench")
+client = _chroma_client()
+_chroma_reset_collection(client)
+collection = client.get_collection(CHROMA_COLLECTION)
 
 # indexing
 start = time.time()
@@ -287,14 +405,14 @@ print(f"Indexing time: {chroma_index_time:.2f}s")
 # PersistentClient auto-persists on every write — measure the overhead of
 # an explicit fsync by timing a no-op round-trip to the same directory.
 start = time.time()
-_ = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+_ = _chroma_client()
 chroma_save_time = time.time() - start
-print(f"Persist (auto, fsync probe): {chroma_save_time:.2f}s")
+mode = f"{CHROMA_HOST}:{CHROMA_PORT}" if CHROMA_HOST else f"path={CHROMA_PERSIST_DIR}"
+print(f"Persist / reopen ({mode}): {chroma_save_time:.2f}s")
 
-# Reload from disk
 start = time.time()
-client_loaded = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
-collection_loaded = client_loaded.get_collection("bench")
+client_loaded = _chroma_client()
+collection_loaded = client_loaded.get_collection(CHROMA_COLLECTION)
 chroma_load_time = time.time() - start
 print(f"Load time: {chroma_load_time:.2f}s")
 
@@ -308,6 +426,7 @@ chroma_latency = chroma_query_time / NQ
 
 print(f"Avg query latency: {chroma_latency*1000:.2f} ms")
 print(f"QPS: {NQ / chroma_query_time:.2f}")
+
 
 
 # =============================
@@ -326,3 +445,15 @@ if not pg_skipped and pg_index_time is not None:
     print(f"  → query latency: {pg_latency * 1000:.2f} ms | QPS: {NQ / pg_query_time:.2f}")
 else:
     print("\npgvector: skipped (see section above)")
+if not qdrant_skipped and qdrant_index_time is not None:
+    print(f"\nQdrant (HNSW default, L2)")
+    print(
+        f"  → index: {qdrant_index_time:.2f}s | persist: {qdrant_save_time:.2f}s "
+        f"| load: {qdrant_load_time:.2f}s"
+    )
+    print(
+        f"  → query latency: {qdrant_latency * 1000:.2f} ms "
+        f"| QPS: {NQ / qdrant_query_time:.2f}"
+    )
+else:
+    print("\nQdrant: skipped (see section above)")

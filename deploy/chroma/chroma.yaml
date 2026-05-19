@@ -1,0 +1,138 @@
+# Chroma server for benchmark.py (100k-vector workload).
+#
+# Deploy:
+#   kubectl apply -f deploy/chroma/chroma.yaml
+#   kubectl wait --for=condition=available deployment/chroma-bench -n chroma-bench --timeout=300s
+#   kubectl get nodes -o wide
+#   kubectl get svc chroma-bench -n chroma-bench
+#
+# From host (NodePort): NODE_IP + port from 8000:<nodePort>/TCP
+#   set CHROMA_HOST=172.19.73.182
+#   set CHROMA_PORT=31234
+#   python benchmark.py
+#
+# In-cluster:
+#   curl http://chroma-bench.chroma-bench.svc:8000/api/v2/heartbeat
+#
+# port-forward:
+#   kubectl port-forward -n chroma-bench svc/chroma-bench 8000:8000
+#   set CHROMA_HOST=127.0.0.1
+#   set CHROMA_PORT=8000
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: chroma-bench
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: chroma-pv
+spec:
+  capacity:
+    storage: 10Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: local-storage
+  local:
+    path: /mnt/kubehome/chroma
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - titan
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: chroma-bench-data
+  namespace: chroma-bench
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-storage
+  volumeName: chroma-pv
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chroma-bench
+  namespace: chroma-bench
+  labels:
+    app: chroma-bench
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chroma-bench
+  template:
+    metadata:
+      labels:
+        app: chroma-bench
+    spec:
+      containers:
+        - name: chroma
+          image: chromadb/chroma:1.5.9
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: IS_PERSISTENT
+              value: "TRUE"
+            - name: PERSIST_DIRECTORY
+              value: /data
+            - name: ANONYMIZED_TELEMETRY
+              value: "FALSE"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /api/v2/heartbeat
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /api/v2/heartbeat
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+            limits:
+              memory: 4Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: chroma-bench-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chroma-bench
+  namespace: chroma-bench
+  labels:
+    app: chroma-bench
+spec:
+  type: NodePort
+  selector:
+    app: chroma-bench
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      # nodePort omitted — Kubernetes assigns 30000–32767; read with kubectl get svc
