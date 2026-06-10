@@ -1,6 +1,7 @@
 """Vector-store benchmarks with 8-thread parallel embedding ingest.
 
 Same four backends as benchmark.py (FAISS, Qdrant, pgvector, Chroma).
+Each backend is reset immediately before parallel ingest (clean index/table/collection).
 Ingest uses INGEST_THREADS workers (default 8); query/save/load match benchmark.py.
 
 Install deps:  pip install -r requirements.txt
@@ -18,6 +19,8 @@ import chromadb
 import faiss
 import numpy as np
 from tqdm import tqdm
+
+import benchmark_storage as storage
 
 try:
     import psycopg
@@ -37,6 +40,10 @@ except ImportError:
 
 # -----------------------------
 # CONFIG
+# $env:PGVECTOR_DSN="postgresql://postgres:postgres@172.19.73.182:32369/postgres"
+# $env:QDRANT_URL="http://172.19.73.182:31189"
+# $env:CHROMA_HOST="172.19.73.182"
+# $env:CHROMA_PORT="32086"
 # -----------------------------
 N = 100_000
 DIM = 384
@@ -61,6 +68,9 @@ PGVECTOR_DSN = os.environ.get(
 
 _qdrant_ingest_client: "QdrantClient | None" = None
 _qdrant_upsert_semaphore: threading.Semaphore | None = None
+_chroma_http_client: chromadb.ClientAPI | None = None
+_chroma_add_lock = threading.Lock()
+_chroma_pf_proc: subprocess.Popen | None = None
 
 
 def _chunk_ranges(n_items: int, n_workers: int) -> list[tuple[int, int, int]]:
@@ -142,18 +152,140 @@ def _pgvector_open_connection() -> tuple[object, subprocess.Popen | None, str]:
     raise last_err
 
 
+def _chroma_use_remote() -> bool:
+    return bool(
+        os.environ.get("CHROMA_URL", "").strip()
+        or os.environ.get("CHROMA_HOST", "").strip()
+        or os.environ.get("CHROMA_KUBECTL_PORT_FORWARD", "").strip().lower()
+        in ("1", "true", "yes")
+    )
+
+
+def _chroma_resolve_connection() -> tuple[str, int, bool]:
+    """Resolve host, port, ssl from CHROMA_URL, CHROMA_HOST/PORT, or port-forward."""
+    use_pf = os.environ.get("CHROMA_KUBECTL_PORT_FORWARD", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if use_pf:
+        host = "127.0.0.1"
+        port = int(os.environ.get("CHROMA_LOCAL_PORT", "8000"))
+        return host, port, False
+
+    url = os.environ.get("CHROMA_URL", "").strip()
+    if url:
+        parsed = urlparse(url)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or (443 if parsed.scheme == "https" else 8000)
+        ssl = parsed.scheme == "https"
+        return host, port, ssl
+
+    host = os.environ.get("CHROMA_HOST", CHROMA_HOST).strip()
+    if host.startswith("http://") or host.startswith("https://"):
+        parsed = urlparse(host)
+        port = parsed.port or int(os.environ.get("CHROMA_PORT", str(CHROMA_PORT)))
+        return parsed.hostname or "localhost", port, parsed.scheme == "https"
+
+    port = int(os.environ.get("CHROMA_PORT", str(CHROMA_PORT)))
+    return host, port, False
+
+
+def _chroma_start_port_forward() -> None:
+    global _chroma_pf_proc
+    local_port = int(os.environ.get("CHROMA_LOCAL_PORT", "8000"))
+    ns = os.environ.get("CHROMA_PORT_FORWARD_NS", "chroma-bench")
+    svc = os.environ.get("CHROMA_PORT_FORWARD_SVC", "chroma-bench")
+    _chroma_pf_proc = subprocess.Popen(
+        ["kubectl", "port-forward", "-n", ns, f"svc/{svc}", f"{local_port}:8000"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    print(
+        f"Chroma: kubectl port-forward svc/{svc} -> 127.0.0.1:{local_port} "
+        f"(pid {_chroma_pf_proc.pid})"
+    )
+
+
+def _chroma_http_client_connect() -> chromadb.ClientAPI:
+    """HttpClient with heartbeat retries; logs resolved URL on failure."""
+    host, port, ssl = _chroma_resolve_connection()
+    scheme = "https" if ssl else "http"
+    target = f"{scheme}://{host}:{port}"
+
+    client = chromadb.HttpClient(host=host, port=port, ssl=ssl)
+    timeout = int(os.environ.get("CHROMA_CONNECT_TIMEOUT", "15"))
+    deadline = time.time() + max(timeout, 15)
+    last_err: Exception | None = None
+    while time.time() < deadline:
+        if _chroma_pf_proc is not None and _chroma_pf_proc.poll() is not None:
+            err = (_chroma_pf_proc.stderr.read() if _chroma_pf_proc.stderr else b"").decode(
+                "utf-8", errors="replace"
+            )
+            raise RuntimeError(f"kubectl port-forward exited early: {err or _chroma_pf_proc.returncode}")
+        try:
+            client.heartbeat()
+            return client
+        except Exception as exc:
+            last_err = exc
+            time.sleep(0.5)
+
+    hint = (
+        f"Cannot reach Chroma at {target}. "
+        "Use NodePort from kubectl get svc (not 8000 unless port-forwarded). "
+        "Example: $env:CHROMA_HOST='<NODE_IP>'; $env:CHROMA_PORT='32086'. "
+        "Or: $env:CHROMA_KUBECTL_PORT_FORWARD='1' with port-forward to 127.0.0.1:8000."
+    )
+    raise ConnectionError(hint) from last_err
+
+
 def _chroma_client():
-    if CHROMA_HOST:
-        return chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
+    global _chroma_http_client
+    if _chroma_use_remote():
+        if _chroma_http_client is None:
+            if os.environ.get("CHROMA_KUBECTL_PORT_FORWARD", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            ):
+                _chroma_start_port_forward()
+            _chroma_http_client = _chroma_http_client_connect()
+        return _chroma_http_client
     return chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
 
 
-def _chroma_reset_collection(client) -> None:
+def _faiss_reset() -> list:
+    """Remove on-disk index and return fresh in-memory shards."""
+    os.makedirs(os.path.dirname(FAISS_INDEX_PATH), exist_ok=True)
+    if os.path.exists(FAISS_INDEX_PATH):
+        os.remove(FAISS_INDEX_PATH)
+    return [faiss.IndexFlatL2(DIM) for _ in range(INGEST_THREADS)]
+
+
+def _chroma_reset_before_ingest():
+    """Wipe local persist dir or remote collection before benchmark ingest."""
+    if not CHROMA_HOST and os.path.exists(CHROMA_PERSIST_DIR):
+        shutil.rmtree(CHROMA_PERSIST_DIR)
+    client = _chroma_client()
     try:
         client.delete_collection(CHROMA_COLLECTION)
     except Exception:
         pass
     client.create_collection(CHROMA_COLLECTION)
+    return client
+
+
+def _pgvector_reset_before_ingest(conn) -> None:
+    """Drop benchmark table (and indexes) and recreate empty schema."""
+    with conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS {PGVECTOR_TABLE} CASCADE")
+        cur.execute(
+            f"CREATE TABLE {PGVECTOR_TABLE} ("
+            "id int PRIMARY KEY, "
+            f"embedding vector({DIM})"
+            ")"
+        )
+    conn.commit()
 
 
 def _qdrant_ingest_parallel_limit() -> int:
@@ -181,13 +313,18 @@ def _qdrant_prepare_parallel_ingest() -> None:
     _qdrant_upsert_semaphore = threading.Semaphore(limit)
 
 
-def _qdrant_reset_collection(client: "QdrantClient") -> None:
+def _qdrant_reset_before_ingest() -> "QdrantClient":
+    """Wipe local storage dir or remote collection before benchmark ingest."""
+    if not QDRANT_URL and os.path.exists(QDRANT_PATH):
+        shutil.rmtree(QDRANT_PATH)
+    client = _qdrant_client()
     if client.collection_exists(QDRANT_COLLECTION):
         client.delete_collection(QDRANT_COLLECTION)
     client.create_collection(
         collection_name=QDRANT_COLLECTION,
         vectors_config=VectorParams(size=DIM, distance=Distance.EUCLID),
     )
+    return client
 
 
 # -----------------------------
@@ -205,7 +342,8 @@ print(f"Parallel ingest: {INGEST_THREADS} threads, batch_size={BATCH_SIZE}")
 # =============================
 print("\n--- FAISS (8-thread ingest) ---")
 
-faiss_shards = [faiss.IndexFlatL2(DIM) for _ in range(INGEST_THREADS)]
+print(f"Resetting FAISS ({FAISS_INDEX_PATH})...")
+faiss_shards = _faiss_reset()
 
 
 def _faiss_ingest_worker(worker_id: int, start: int, end: int) -> None:
@@ -220,16 +358,13 @@ for shard in faiss_shards:
 faiss_index_time = time.time() - start
 print(f"Indexing time: {faiss_index_time:.2f}s")
 
-os.makedirs(os.path.dirname(FAISS_INDEX_PATH), exist_ok=True)
-if os.path.exists(FAISS_INDEX_PATH):
-    os.remove(FAISS_INDEX_PATH)
-
 start = time.time()
 faiss.write_index(index, FAISS_INDEX_PATH)
 faiss_save_time = time.time() - start
-faiss_file_size = os.path.getsize(FAISS_INDEX_PATH)
+faiss_storage_bytes = storage.file_size(FAISS_INDEX_PATH)
 print(f"Save time: {faiss_save_time:.2f}s")
-print(f"Saved index file: {FAISS_INDEX_PATH} ({faiss_file_size:,} bytes)")
+print(f"Saved index file: {FAISS_INDEX_PATH}")
+storage.print_storage_size("Database size", faiss_storage_bytes, "index file on disk")
 
 start = time.time()
 index_loaded = faiss.read_index(FAISS_INDEX_PATH)
@@ -254,6 +389,7 @@ qdrant_save_time = None
 qdrant_load_time = None
 qdrant_query_time = None
 qdrant_latency = None
+qdrant_storage_bytes = None
 qdrant_skipped = False
 
 if not _QDRANT_AVAILABLE:
@@ -261,11 +397,8 @@ if not _QDRANT_AVAILABLE:
     qdrant_skipped = True
 else:
     try:
-        if not QDRANT_URL and os.path.exists(QDRANT_PATH):
-            shutil.rmtree(QDRANT_PATH)
-
-        qdrant_setup_client = _qdrant_client()
-        _qdrant_reset_collection(qdrant_setup_client)
+        print(f"Resetting Qdrant (collection={QDRANT_COLLECTION})...")
+        _qdrant_reset_before_ingest()
         _qdrant_prepare_parallel_ingest()
         assert _qdrant_ingest_client is not None
         assert _qdrant_upsert_semaphore is not None
@@ -319,6 +452,15 @@ else:
         print(f"Avg query latency: {qdrant_latency * 1000:.2f} ms")
         print(f"QPS: {NQ / qdrant_query_time:.2f}")
 
+        qdrant_storage_bytes, qdrant_method = storage.qdrant_storage_bytes(
+            client_loaded,
+            QDRANT_COLLECTION,
+            local_path=QDRANT_PATH if not QDRANT_URL else "",
+            n_points=row_count,
+            dim=DIM,
+        )
+        storage.print_storage_size("Database size", qdrant_storage_bytes, qdrant_method)
+
     except Exception as e:
         print(f"Skipped: {e}")
         if QDRANT_URL:
@@ -337,6 +479,7 @@ pg_save_time = None
 pg_load_time = None
 pg_query_time = None
 pg_latency = None
+pg_storage_bytes = None
 pg_skipped = False
 
 if not _PGVECTOR_AVAILABLE:
@@ -353,15 +496,8 @@ else:
         conn.commit()
         register_vector(conn)
 
-        with conn.cursor() as cur:
-            cur.execute(f"DROP TABLE IF EXISTS {PGVECTOR_TABLE}")
-            cur.execute(
-                f"CREATE TABLE {PGVECTOR_TABLE} ("
-                "id int PRIMARY KEY, "
-                f"embedding vector({DIM})"
-                ")"
-            )
-        conn.commit()
+        print(f"Resetting pgvector (table={PGVECTOR_TABLE})...")
+        _pgvector_reset_before_ingest(conn)
 
         pg_connect_timeout = int(os.environ.get("PGVECTOR_CONNECT_TIMEOUT", "10"))
 
@@ -429,6 +565,11 @@ else:
                 )
                 cur.fetchall()
         pg_query_time = time.time() - start
+
+        pg_storage_bytes = storage.pgvector_table_bytes(conn_loaded, PGVECTOR_TABLE)
+        storage.print_storage_size(
+            "Database size", pg_storage_bytes, "pg_total_relation_size (table + indexes)"
+        )
         conn_loaded.close()
 
         pg_latency = pg_query_time / NQ
@@ -453,48 +594,85 @@ else:
 # =============================
 print("\n--- Chroma (8-thread ingest) ---")
 
-if not CHROMA_HOST and os.path.exists(CHROMA_PERSIST_DIR):
-    shutil.rmtree(CHROMA_PERSIST_DIR)
+chroma_index_time = None
+chroma_save_time = None
+chroma_load_time = None
+chroma_query_time = None
+chroma_latency = None
+chroma_storage_bytes = None
+chroma_skipped = False
 
-chroma_client = _chroma_client()
-_chroma_reset_collection(chroma_client)
+try:
+    print(f"Resetting Chroma (collection={CHROMA_COLLECTION})...")
+    chroma_client = _chroma_reset_before_ingest()
+    if _chroma_use_remote():
+        host, port, _ = _chroma_resolve_connection()
+        print(f"Chroma remote: http://{host}:{port} ({INGEST_THREADS} workers, shared client)")
 
+    collection = chroma_client.get_collection(CHROMA_COLLECTION)
 
-def _chroma_ingest_worker(_worker_id: int, start: int, end: int) -> None:
-    client = _chroma_client()
-    collection = client.get_collection(CHROMA_COLLECTION)
-    for i in range(start, end, BATCH_SIZE):
-        batch_end = min(i + BATCH_SIZE, end)
-        collection.add(
-            embeddings=xb[i:batch_end].tolist(),
-            ids=[str(j) for j in range(i, batch_end)],
-        )
+    def _chroma_ingest_worker(_worker_id: int, start: int, end: int) -> None:
+        for i in range(start, end, BATCH_SIZE):
+            batch_end = min(i + BATCH_SIZE, end)
+            rows = (
+                xb[i:batch_end].tolist(),
+                [str(j) for j in range(i, batch_end)],
+            )
+            if _chroma_use_remote():
+                with _chroma_add_lock:
+                    collection.add(embeddings=rows[0], ids=rows[1])
+            else:
+                collection.add(embeddings=rows[0], ids=rows[1])
 
+    start = time.time()
+    _parallel_ingest(N, _chroma_ingest_worker, desc="chroma add")
+    chroma_index_time = time.time() - start
+    print(f"Indexing time: {chroma_index_time:.2f}s")
 
-start = time.time()
-_parallel_ingest(N, _chroma_ingest_worker, desc="chroma add")
-chroma_index_time = time.time() - start
-print(f"Indexing time: {chroma_index_time:.2f}s")
+    start = time.time()
+    _ = _chroma_client()
+    chroma_save_time = time.time() - start
+    if _chroma_use_remote():
+        h, p, _ = _chroma_resolve_connection()
+        mode = f"http://{h}:{p}"
+    else:
+        mode = f"path={CHROMA_PERSIST_DIR}"
+    print(f"Persist / reopen ({mode}): {chroma_save_time:.2f}s")
 
-start = time.time()
-_ = _chroma_client()
-chroma_save_time = time.time() - start
-mode = f"{CHROMA_HOST}:{CHROMA_PORT}" if CHROMA_HOST else f"path={CHROMA_PERSIST_DIR}"
-print(f"Persist / reopen ({mode}): {chroma_save_time:.2f}s")
+    start = time.time()
+    client_loaded = _chroma_client()
+    collection_loaded = client_loaded.get_collection(CHROMA_COLLECTION)
+    chroma_load_time = time.time() - start
+    print(f"Load time: {chroma_load_time:.2f}s")
 
-start = time.time()
-client_loaded = _chroma_client()
-collection_loaded = client_loaded.get_collection(CHROMA_COLLECTION)
-chroma_load_time = time.time() - start
-print(f"Load time: {chroma_load_time:.2f}s")
+    start = time.time()
+    for q in xq:
+        collection_loaded.query(query_embeddings=[q.tolist()], n_results=TOP_K)
+    chroma_query_time = time.time() - start
+    chroma_latency = chroma_query_time / NQ
+    print(f"Avg query latency: {chroma_latency * 1000:.2f} ms")
+    print(f"QPS: {NQ / chroma_query_time:.2f}")
 
-start = time.time()
-for q in xq:
-    collection_loaded.query(query_embeddings=[q.tolist()], n_results=TOP_K)
-chroma_query_time = time.time() - start
-chroma_latency = chroma_query_time / NQ
-print(f"Avg query latency: {chroma_latency * 1000:.2f} ms")
-print(f"QPS: {NQ / chroma_query_time:.2f}")
+    chroma_storage_bytes, chroma_method = storage.chroma_storage_bytes(
+        collection_loaded,
+        persist_dir=CHROMA_PERSIST_DIR,
+        remote=_chroma_use_remote(),
+        dim=DIM,
+    )
+    storage.print_storage_size("Database size", chroma_storage_bytes, chroma_method)
+
+except Exception as e:
+    print(f"Skipped: {e}")
+    if _chroma_use_remote():
+        try:
+            h, p, _ = _chroma_resolve_connection()
+            print(f"  target: http://{h}:{p}")
+        except Exception:
+            pass
+    chroma_skipped = True
+finally:
+    if _chroma_pf_proc is not None:
+        _chroma_pf_proc.terminate()
 
 # =============================
 # SUMMARY
@@ -506,12 +684,17 @@ print(
     f"| load: {faiss_load_time:.2f}s"
 )
 print(f"  → query latency: {faiss_latency * 1000:.2f} ms | QPS: {NQ / faiss_query_time:.2f}")
-print(f"\nChroma ({INGEST_THREADS} threads)")
-print(
-    f"  → index: {chroma_index_time:.2f}s | persist: {chroma_save_time:.2f}s "
-    f"| load: {chroma_load_time:.2f}s"
-)
-print(f"  → query latency: {chroma_latency * 1000:.2f} ms | QPS: {NQ / chroma_query_time:.2f}")
+print(f"  → size: {storage.format_bytes(faiss_storage_bytes)}")
+if not chroma_skipped and chroma_index_time is not None:
+    print(f"\nChroma ({INGEST_THREADS} threads)")
+    print(
+        f"  → index: {chroma_index_time:.2f}s | persist: {chroma_save_time:.2f}s "
+        f"| load: {chroma_load_time:.2f}s"
+    )
+    print(f"  → query latency: {chroma_latency * 1000:.2f} ms | QPS: {NQ / chroma_query_time:.2f}")
+    print(f"  → size: {storage.format_bytes(chroma_storage_bytes)}")
+else:
+    print("\nChroma: skipped (see section above)")
 if not pg_skipped and pg_index_time is not None:
     print(f"\npgvector (HNSW, L2, {INGEST_THREADS} threads)")
     print(
@@ -519,6 +702,7 @@ if not pg_skipped and pg_index_time is not None:
         f"| load: {pg_load_time:.2f}s"
     )
     print(f"  → query latency: {pg_latency * 1000:.2f} ms | QPS: {NQ / pg_query_time:.2f}")
+    print(f"  → size: {storage.format_bytes(pg_storage_bytes)}")
 else:
     print("\npgvector: skipped (see section above)")
 if not qdrant_skipped and qdrant_index_time is not None:
@@ -531,5 +715,6 @@ if not qdrant_skipped and qdrant_index_time is not None:
         f"  → query latency: {qdrant_latency * 1000:.2f} ms "
         f"| QPS: {NQ / qdrant_query_time:.2f}"
     )
+    print(f"  → size: {storage.format_bytes(qdrant_storage_bytes)}")
 else:
     print("\nQdrant: skipped (see section above)")

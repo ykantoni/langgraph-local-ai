@@ -14,6 +14,8 @@ import chromadb
 import faiss
 from tqdm import tqdm
 
+import benchmark_storage as storage
+
 try:
     import psycopg
     from pgvector.psycopg import register_vector
@@ -171,9 +173,10 @@ if os.path.exists(FAISS_INDEX_PATH):
 start = time.time()
 faiss.write_index(index, FAISS_INDEX_PATH)
 faiss_save_time = time.time() - start
-faiss_file_size = os.path.getsize(FAISS_INDEX_PATH)
+faiss_storage_bytes = storage.file_size(FAISS_INDEX_PATH)
 print(f"Save time: {faiss_save_time:.2f}s")
-print(f"Saved index file: {FAISS_INDEX_PATH} ({faiss_file_size:,} bytes)")
+print(f"Saved index file: {FAISS_INDEX_PATH}")
+storage.print_storage_size("Database size", faiss_storage_bytes, "index file on disk")
 
 # Load index from disk
 start = time.time()
@@ -206,6 +209,8 @@ qdrant_save_time = None
 qdrant_load_time = None
 qdrant_query_time = None
 qdrant_latency = None
+qdrant_storage_bytes = None
+qdrant_storage_method = ""
 qdrant_skipped = False
 
 if not _QDRANT_AVAILABLE:
@@ -257,6 +262,15 @@ else:
         print(f"Avg query latency: {qdrant_latency * 1000:.2f} ms")
         print(f"QPS: {NQ / qdrant_query_time:.2f}")
 
+        qdrant_storage_bytes, qdrant_storage_method = storage.qdrant_storage_bytes(
+            client_loaded,
+            QDRANT_COLLECTION,
+            local_path=QDRANT_PATH if not QDRANT_URL else "",
+            n_points=row_count,
+            dim=DIM,
+        )
+        storage.print_storage_size("Database size", qdrant_storage_bytes, qdrant_storage_method)
+
     except Exception as e:
         print(f"Skipped: {e}")
         if QDRANT_URL:
@@ -280,6 +294,7 @@ pg_save_time = None
 pg_load_time = None
 pg_query_time = None
 pg_latency = None
+pg_storage_bytes = None
 pg_skipped = False
 
 if not _PGVECTOR_AVAILABLE:
@@ -356,6 +371,11 @@ else:
                 )
                 cur.fetchall()
         pg_query_time = time.time() - start
+
+        pg_storage_bytes = storage.pgvector_table_bytes(conn_loaded, PGVECTOR_TABLE)
+        storage.print_storage_size(
+            "Database size", pg_storage_bytes, "pg_total_relation_size (table + indexes)"
+        )
         conn_loaded.close()
 
         pg_latency = pg_query_time / NQ
@@ -427,26 +447,37 @@ chroma_latency = chroma_query_time / NQ
 print(f"Avg query latency: {chroma_latency*1000:.2f} ms")
 print(f"QPS: {NQ / chroma_query_time:.2f}")
 
+chroma_storage_bytes, chroma_storage_method = storage.chroma_storage_bytes(
+    collection_loaded,
+    persist_dir=CHROMA_PERSIST_DIR,
+    remote=bool(CHROMA_HOST),
+    dim=DIM,
+)
+storage.print_storage_size("Database size", chroma_storage_bytes, chroma_storage_method)
+
 
 
 # =============================
 # SUMMARY
 # =============================
 print("\n=== SUMMARY ===")
-print(f"FAISS")
+print("FAISS")
 print(f"  → index: {faiss_index_time:.2f}s | save: {faiss_save_time:.2f}s | load: {faiss_load_time:.2f}s")
 print(f"  → query latency: {faiss_latency*1000:.2f} ms | QPS: {NQ / faiss_query_time:.2f}")
-print(f"\nChroma")
+print(f"  → size: {storage.format_bytes(faiss_storage_bytes)}")
+print("\nChroma")
 print(f"  → index: {chroma_index_time:.2f}s | persist: {chroma_save_time:.2f}s | load: {chroma_load_time:.2f}s")
 print(f"  → query latency: {chroma_latency*1000:.2f} ms | QPS: {NQ / chroma_query_time:.2f}")
+print(f"  → size: {storage.format_bytes(chroma_storage_bytes)}")
 if not pg_skipped and pg_index_time is not None:
-    print(f"\npgvector (HNSW, L2)")
+    print("\npgvector (HNSW, L2)")
     print(f"  → index: {pg_index_time:.2f}s | commit: {pg_save_time:.4f}s | load: {pg_load_time:.2f}s")
     print(f"  → query latency: {pg_latency * 1000:.2f} ms | QPS: {NQ / pg_query_time:.2f}")
+    print(f"  → size: {storage.format_bytes(pg_storage_bytes)}")
 else:
     print("\npgvector: skipped (see section above)")
 if not qdrant_skipped and qdrant_index_time is not None:
-    print(f"\nQdrant (HNSW default, L2)")
+    print("\nQdrant (HNSW default, L2)")
     print(
         f"  → index: {qdrant_index_time:.2f}s | persist: {qdrant_save_time:.2f}s "
         f"| load: {qdrant_load_time:.2f}s"
@@ -455,5 +486,6 @@ if not qdrant_skipped and qdrant_index_time is not None:
         f"  → query latency: {qdrant_latency * 1000:.2f} ms "
         f"| QPS: {NQ / qdrant_query_time:.2f}"
     )
+    print(f"  → size: {storage.format_bytes(qdrant_storage_bytes)}")
 else:
     print("\nQdrant: skipped (see section above)")
