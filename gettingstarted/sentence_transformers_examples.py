@@ -148,6 +148,8 @@ def example_normalize_embeddings(model: SentenceTransformer) -> None:
     sentences = ["vector database benchmark", "embedding ingest throughput"]
     raw = model.encode(sentences, normalize_embeddings=False)
     normed = model.encode(sentences, normalize_embeddings=True)
+    print(f"raw L2:     {raw}")
+    print(f"normalized: {normed}")    
     import numpy as np
 
     raw_norms = np.linalg.norm(raw, axis=1)
@@ -156,6 +158,83 @@ def example_normalize_embeddings(model: SentenceTransformer) -> None:
     print(f"normalized norms: {normed_norms}")
 
 
+def my(model: SentenceTransformer) -> None:
+    """Custom embedding / similarity playground (uses all-mpnet-base-v2 on CUDA)."""
+    print("\n=== my ===")
+    print("\n=== simple encodings ===")
+    query = "How do I reset my password?"
+    query2 = "I forgot my password"
+    query3 = "I love you baby"
+    e1 = model.encode(query)
+
+    print(len(e1))
+    print(e1[:10])
+    e2 = model.encode(query2)
+    print(len(e2))
+    print(e2[:10])
+    score = cos_sim(e1, e2)
+    print(score)
+
+    e3 = model.encode(query3)
+    print(len(e3))
+    print(e3[:10])
+    score = cos_sim(e1, e3)
+    print(score)
+
+    print("\n=== my ===")
+    sentences = [
+        query,
+        "I forgot my password",
+        "Click Forgot password on the login page.",
+        "Check an email for a reset password link.",
+        "Pass me a sword please.",
+        "I forgot my sword.",
+    ]
+
+    embeddings = model.encode(sentences)
+    print(embeddings.shape)
+    print(embeddings[:10])
+    similarities = model.similarity(embeddings, embeddings)
+    print(similarities)
+
+    print("e1:", query)
+    print("sentences:")
+    for sentence in sentences:
+        print(f"  {sentence}")
+
+    similarities = model.similarity(e1, embeddings)
+    print("e1 vs sentences:")
+    for sentence, score in zip(sentences, similarities[0].tolist()):
+        print(f"  {score:.4f}  {sentence}")
+
+    scores = util.cos_sim(e1, embeddings)[0]
+    ranked = sorted(enumerate(scores.tolist()), key=lambda x: x[1], reverse=True)
+    print(f"query: {query!r}")
+    for idx, score in ranked:
+        print(f"  {score:.4f}  {sentences[idx]!r}")
+
+    queries = [
+        "How do I reset my password?",
+        "How do I get my sword back?",
+    ]
+
+    for q in queries:
+        q_embedding = model.encode(q, convert_to_tensor=True)
+        hits = util.semantic_search(q_embedding, embeddings, top_k=3)[0]
+        print(f"\nquery: {q!r}")
+        for hit in hits:
+            doc = sentences[hit["corpus_id"]]
+            print(f"  {hit['score']:.4f}  {doc!r}")
+
+    MY_QUERY_PROMPT = "Authentication and authorization for the enterprise user "            
+    for q in queries:
+        q_embedding = model.encode(MY_QUERY_PROMPT + q, convert_to_tensor=True)
+        hits = util.semantic_search(q_embedding, embeddings, top_k=3)[0]
+        print(f"\nquery: {q!r}")
+        for hit in hits:
+            doc = sentences[hit["corpus_id"]]
+            print(f"  {hit['score']:.4f}  {doc!r}")
+
 EXAMPLES = {
     "encode": example_encode,
     "similarity": example_similarity,
@@ -163,6 +242,7 @@ EXAMPLES = {
     "semantic_search": example_semantic_search,
     "asymmetric_search": example_asymmetric_search,
     "normalize": example_normalize_embeddings,
+    "my": my,
 }
 
 
@@ -202,55 +282,5 @@ def main() -> None:
         EXAMPLES[args.example](model)
 
 
-def main2() -> None:
-    model = _load_model("all-mpnet-base-v2", device="cuda")
-#    model = _load_model(DEFAULT_RETRIEVAL_MODEL, device="cuda")
-
-    e1 = model.encode(
-        "How do I reset my password?"
-    )
-
-    print(len(e1))
-    print(e1[:10])
-    e2 = model.encode("I forgot my password")
-    print(len(e2))
-    print(e2[:10])
-    score = cos_sim(e1, e2)
-
-    print(score)
-
-    e3 = model.encode("I love you baby")
-    print(len(e3))
-    print(e3[:10])
-    score = cos_sim(e1, e3)    
-    print(score)
-
-    sentences = [
-        "How do I reset my password?",
-        "I forgot my password",
-        "Click Forgot password on the login page.",
-        "Check an email for a reset password link.",
-        "Pass me a sword please.",
-        "I forgot my sword.",
-    ]
-
-    # 2. Calculate embeddings by calling model.encode()
-    embeddings = model.encode(sentences)
-    print(embeddings.shape)
-    print(embeddings[:10])
-    similarities = model.similarity(embeddings, embeddings)
-    print(similarities)
-
-    print("e1:", "How do I reset my password?")
-    print("sentences:")
-    for sentence in sentences:
-        print(f"  {sentence}")
-
-    similarities = model.similarity(e1, embeddings)
-    print("e1 vs sentences:")
-    for sentence, score in zip(sentences, similarities[0].tolist()):
-        print(f"  {score:.4f}  {sentence}")
-
-
 if __name__ == "__main__":
-    main2()
+    main()
