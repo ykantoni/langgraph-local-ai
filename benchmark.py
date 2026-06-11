@@ -1,4 +1,4 @@
-"""Vector-store benchmarks (FAISS, Chroma, pgvector, Qdrant).
+"""Vector-store benchmarks (FAISS, Chroma, pgvector, Qdrant, OpenSearch).
 
 Install deps:  pip install -r requirements.txt
 """
@@ -14,6 +14,7 @@ import chromadb
 import faiss
 from tqdm import tqdm
 
+import benchmark_opensearch as opensearch_bench
 import benchmark_storage as storage
 
 try:
@@ -56,6 +57,8 @@ PGVECTOR_DSN = os.environ.get(
     "PGVECTOR_DSN",
     "postgresql://postgres:postgres@127.0.0.1:5432/postgres",
 )
+OPENSEARCH_INDEX = os.environ.get("OPENSEARCH_INDEX", "bench_vectors")
+BATCH_SIZE = 1000
 
 
 def _pgvector_open_connection() -> tuple[object, subprocess.Popen | None, str]:
@@ -455,7 +458,80 @@ chroma_storage_bytes, chroma_storage_method = storage.chroma_storage_bytes(
 )
 storage.print_storage_size("Database size", chroma_storage_bytes, chroma_storage_method)
 
+# =============================
+# OPENSEARCH BENCHMARK
+# =============================
+# OPENSEARCH_HOST / OPENSEARCH_PORT (default 127.0.0.1:9200)
+# OPENSEARCH_USER / OPENSEARCH_PASSWORD if security plugin is enabled
+# OPENSEARCH_KUBECTL_PORT_FORWARD=1 for kubectl port-forward to localhost
+print("\n--- OpenSearch (k-NN) ---")
 
+os_index_time = None
+os_save_time = None
+os_load_time = None
+os_query_time = None
+os_latency = None
+os_storage_bytes = None
+os_skipped = False
+os_cfg = opensearch_bench.resolve_config(default_index=OPENSEARCH_INDEX)
+
+if not opensearch_bench.OPENSEARCH_AVAILABLE:
+    print("Skipped: install opensearch-py (pip install -r requirements.txt)")
+    os_skipped = True
+else:
+    try:
+        client = opensearch_bench.create_client(os_cfg)
+        print(f"Resetting OpenSearch index={os_cfg['index']} ...")
+        opensearch_bench.reset_index(client, os_cfg["index"], DIM)
+
+        start = time.time()
+        for i in tqdm(range(0, N, BATCH_SIZE), desc="opensearch bulk"):
+            opensearch_bench.bulk_ingest(
+                client,
+                os_cfg["index"],
+                xb,
+                i,
+                min(i + BATCH_SIZE, N),
+                BATCH_SIZE,
+                refresh=os_cfg["refresh_on_write"],
+            )
+        if not os_cfg["refresh_on_write"]:
+            opensearch_bench.refresh_index(client, os_cfg["index"])
+        os_index_time = time.time() - start
+        print(f"Indexing time (bulk + refresh): {os_index_time:.2f}s")
+
+        start = time.time()
+        _ = opensearch_bench.create_client(os_cfg)
+        os_save_time = time.time() - start
+        print(f"Reconnect ({opensearch_bench.target_label(os_cfg)}): {os_save_time:.2f}s")
+
+        start = time.time()
+        client_loaded = opensearch_bench.create_client(os_cfg)
+        row_count = opensearch_bench.document_count(client_loaded, os_cfg["index"])
+        os_load_time = time.time() - start
+        print(f"Load time: {os_load_time:.2f}s ({row_count:,} docs)")
+
+        start = time.time()
+        for q in xq:
+            opensearch_bench.knn_search(client_loaded, os_cfg["index"], q, TOP_K)
+        os_query_time = time.time() - start
+        os_latency = os_query_time / NQ
+        print(f"Avg query latency: {os_latency * 1000:.2f} ms")
+        print(f"QPS: {NQ / os_query_time:.2f}")
+
+        os_storage_bytes, os_method = opensearch_bench.index_store_bytes(
+            client_loaded, os_cfg["index"]
+        )
+        if os_storage_bytes <= 0:
+            os_storage_bytes = storage.estimate_raw_vector_bytes(row_count, DIM)
+            os_method = "estimate (float32 vectors only)"
+        storage.print_storage_size("Database size", os_storage_bytes, os_method)
+    except Exception as e:
+        print(f"Skipped: {e}")
+        print(f"  target: {opensearch_bench.target_label(os_cfg)}")
+        os_skipped = True
+    finally:
+        opensearch_bench.stop_port_forward()
 
 # =============================
 # SUMMARY
@@ -489,3 +565,13 @@ if not qdrant_skipped and qdrant_index_time is not None:
     print(f"  → size: {storage.format_bytes(qdrant_storage_bytes)}")
 else:
     print("\nQdrant: skipped (see section above)")
+if not os_skipped and os_index_time is not None:
+    print("\nOpenSearch (k-NN HNSW, L2)")
+    print(
+        f"  → index: {os_index_time:.2f}s | reconnect: {os_save_time:.2f}s "
+        f"| load: {os_load_time:.2f}s"
+    )
+    print(f"  → query latency: {os_latency * 1000:.2f} ms | QPS: {NQ / os_query_time:.2f}")
+    print(f"  → size: {storage.format_bytes(os_storage_bytes)}")
+else:
+    print("\nOpenSearch: skipped (see section above)")

@@ -1,6 +1,6 @@
 """Vector-store benchmarks with 8-thread parallel embedding ingest.
 
-Same four backends as benchmark.py (FAISS, Qdrant, pgvector, Chroma).
+Same backends as benchmark.py (FAISS, Qdrant, pgvector, Chroma, OpenSearch).
 Each backend is reset immediately before parallel ingest (clean index/table/collection).
 Ingest uses INGEST_THREADS workers (default 8); query/save/load match benchmark.py.
 
@@ -20,6 +20,7 @@ import faiss
 import numpy as np
 from tqdm import tqdm
 
+import benchmark_opensearch as opensearch_bench
 import benchmark_storage as storage
 
 try:
@@ -65,6 +66,7 @@ PGVECTOR_DSN = os.environ.get(
     "PGVECTOR_DSN",
     "postgresql://postgres:postgres@127.0.0.1:5432/postgres",
 )
+OPENSEARCH_INDEX = os.environ.get("OPENSEARCH_INDEX", "bench_vectors_8")
 
 _qdrant_ingest_client: "QdrantClient | None" = None
 _qdrant_upsert_semaphore: threading.Semaphore | None = None
@@ -675,6 +677,87 @@ finally:
         _chroma_pf_proc.terminate()
 
 # =============================
+# OPENSEARCH BENCHMARK
+# =============================
+print("\n--- OpenSearch (k-NN, 8-thread ingest) ---")
+
+os_index_time = None
+os_save_time = None
+os_load_time = None
+os_query_time = None
+os_latency = None
+os_storage_bytes = None
+os_skipped = False
+os_cfg = opensearch_bench.resolve_config(default_index=OPENSEARCH_INDEX)
+
+if not opensearch_bench.OPENSEARCH_AVAILABLE:
+    print("Skipped: install opensearch-py (pip install -r requirements.txt)")
+    os_skipped = True
+else:
+    try:
+        client = opensearch_bench.create_client(os_cfg)
+        print(f"Resetting OpenSearch index={os_cfg['index']} ...")
+        opensearch_bench.reset_index(client, os_cfg["index"], DIM)
+        opensearch_bench.prepare_parallel_ingest()
+        parallel_limit = max(1, int(os.environ.get("OPENSEARCH_INGEST_PARALLEL", "4")))
+        print(
+            f"OpenSearch ingest: {INGEST_THREADS} workers, "
+            f"{parallel_limit} concurrent bulk requests "
+            f"(override: OPENSEARCH_INGEST_PARALLEL)"
+        )
+
+        def _opensearch_ingest_worker(_worker_id: int, start: int, end: int) -> None:
+            opensearch_bench.parallel_bulk_ingest(
+                client,
+                os_cfg["index"],
+                xb,
+                start,
+                end,
+                BATCH_SIZE,
+                refresh=os_cfg["refresh_on_write"],
+            )
+
+        start = time.time()
+        _parallel_ingest(N, _opensearch_ingest_worker, desc="opensearch bulk")
+        if not os_cfg["refresh_on_write"]:
+            opensearch_bench.refresh_index(client, os_cfg["index"])
+        os_index_time = time.time() - start
+        print(f"Indexing time (parallel bulk + refresh): {os_index_time:.2f}s")
+
+        start = time.time()
+        _ = opensearch_bench.create_client(os_cfg)
+        os_save_time = time.time() - start
+        print(f"Reconnect ({opensearch_bench.target_label(os_cfg)}): {os_save_time:.2f}s")
+
+        start = time.time()
+        client_loaded = opensearch_bench.create_client(os_cfg)
+        row_count = opensearch_bench.document_count(client_loaded, os_cfg["index"])
+        os_load_time = time.time() - start
+        print(f"Load time: {os_load_time:.2f}s ({row_count:,} docs)")
+
+        start = time.time()
+        for q in xq:
+            opensearch_bench.knn_search(client_loaded, os_cfg["index"], q, TOP_K)
+        os_query_time = time.time() - start
+        os_latency = os_query_time / NQ
+        print(f"Avg query latency: {os_latency * 1000:.2f} ms")
+        print(f"QPS: {NQ / os_query_time:.2f}")
+
+        os_storage_bytes, os_method = opensearch_bench.index_store_bytes(
+            client_loaded, os_cfg["index"]
+        )
+        if os_storage_bytes <= 0:
+            os_storage_bytes = storage.estimate_raw_vector_bytes(row_count, DIM)
+            os_method = "estimate (float32 vectors only)"
+        storage.print_storage_size("Database size", os_storage_bytes, os_method)
+    except Exception as e:
+        print(f"Skipped: {e}")
+        print(f"  target: {opensearch_bench.target_label(os_cfg)}")
+        os_skipped = True
+    finally:
+        opensearch_bench.stop_port_forward()
+
+# =============================
 # SUMMARY
 # =============================
 print("\n=== SUMMARY (benchmark8, parallel ingest) ===")
@@ -718,3 +801,16 @@ if not qdrant_skipped and qdrant_index_time is not None:
     print(f"  → size: {storage.format_bytes(qdrant_storage_bytes)}")
 else:
     print("\nQdrant: skipped (see section above)")
+if not os_skipped and os_index_time is not None:
+    print(f"\nOpenSearch (k-NN HNSW, L2, {INGEST_THREADS} threads)")
+    print(
+        f"  → index: {os_index_time:.2f}s | reconnect: {os_save_time:.2f}s "
+        f"| load: {os_load_time:.2f}s"
+    )
+    print(
+        f"  → query latency: {os_latency * 1000:.2f} ms "
+        f"| QPS: {NQ / os_query_time:.2f}"
+    )
+    print(f"  → size: {storage.format_bytes(os_storage_bytes)}")
+else:
+    print("\nOpenSearch: skipped (see section above)")

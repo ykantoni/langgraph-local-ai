@@ -20,4 +20,5 @@ langchain-mcp-adapters==0.2.2
 psycopg[binary]==3.3.3
 pgvector==0.4.2
 qdrant-client==1.17.0
+opensearch-py==2.8.0
 
