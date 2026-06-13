@@ -1,0 +1,70 @@
+# Helm values for opensearch/opensearch (benchmark single-node cluster).
+# Admin password is NOT stored here — deploy.ps1 / deploy.sh pass
+# OPENSEARCH_INITIAL_ADMIN_PASSWORD from the environment at install time.
+#
+# Chart defaults (verify before deploy):
+#   helm repo add opensearch https://opensearch-project.github.io/helm-charts/
+#   helm search repo opensearch/opensearch --versions
+
+fullnameOverride: opensearch-bench
+clusterName: opensearch-bench
+nodeGroup: master
+masterService: opensearch-bench
+
+# One data node is enough for benchmark.py / benchmark8.py.
+singleNode: true
+replicas: 1
+
+protocol: https
+httpPort: 9200
+
+service:
+  type: NodePort
+  # Leave nodePort empty for auto-assignment; set a fixed port if your cluster requires it.
+  nodePort: ""
+
+image:
+  repository: opensearchproject/opensearch
+  # Empty tag → chart appVersion (latest chart release, e.g. 3.1.0).
+  tag: ""
+  pullPolicy: IfNotPresent
+
+opensearchJavaOpts: "-Xmx2g -Xms2g"
+
+resources:
+  requests:
+    cpu: "500m"
+    memory: "2Gi"
+  limits:
+    memory: "4Gi"
+
+# Required on many clusters (vm.max_map_count).
+sysctlInit:
+  enabled: true
+
+persistence:
+  enabled: true
+  size: 20Gi
+  # Omit or set to your cluster default / local-storage (see deploy/chroma, deploy/qdrant).
+  # storageClass: local-storage
+  accessModes:
+    - ReadWriteOnce
+
+# Pin to a node with local disk (optional; edit for your cluster).
+# nodeSelector:
+#   kubernetes.io/hostname: titan
+
+config:
+  opensearch.yml: |
+    cluster.name: opensearch-bench
+    network.host: 0.0.0.0
+    plugins.security.ssl.http.enabled: true
+    plugins.security.ssl.transport.enabled: true
+    plugins.security.allow_default_init_securityindex: true
+
+# Password injected by deploy script:
+#   extraEnvs:
+#     - name: OPENSEARCH_INITIAL_ADMIN_PASSWORD
+#       value: <from shell env>
+
+extraEnvs: []
