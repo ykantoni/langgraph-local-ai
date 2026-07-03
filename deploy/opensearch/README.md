@@ -123,6 +123,8 @@ helm uninstall opensearch-operator -n opensearch-operator-system
 | File | Purpose |
 |------|---------|
 | `cluster.yaml` | `OpenSearchCluster` manifest template (`__OPENSEARCH_VERSION__` substituted at deploy) |
+| `apply-cluster.sh` / `apply-cluster.ps1` | Apply config changes to an existing cluster (renders version placeholder) |
+| `rollout-restart.sh` / `rollout-restart.ps1` | Manual rolling pod restart when the operator does not restart nodes |
 | `operator-values.yaml` | Operator Helm defaults (webhooks off without cert-manager) |
 | `deploy.ps1` | Windows deploy script |
 | `deploy.sh` | Linux deploy script |
@@ -138,6 +140,55 @@ Edit `cluster.yaml` to tune:
 - `dashboards.enable: true` — optional Dashboards on the same OpenSearchCluster (or use `dashboards/` Helm chart for external OpenSearch)
 
 The admin password is **never** stored in `cluster.yaml`. It is passed via `OPENSEARCH_INITIAL_ADMIN_PASSWORD` into secret `opensearch-bench-admin-credentials`, referenced by `adminCredentialsSecret` and `OPENSEARCH_INITIAL_ADMIN_PASSWORD` on node pods.
+
+## Update cluster configuration (e.g. CORS)
+
+Do **not** run `kubectl apply -f deploy/opensearch/cluster.yaml` directly. The template contains `__OPENSEARCH_VERSION__`, which must be substituted before apply.
+
+**Apply rendered manifest:**
+
+```bash
+chmod +x deploy/opensearch/apply-cluster.sh deploy/opensearch/rollout-restart.sh
+./deploy/opensearch/apply-cluster.sh
+```
+
+```powershell
+.\deploy\opensearch\apply-cluster.ps1
+```
+
+The operator should detect `additionalConfig` changes and perform a rolling restart. It waits for the cluster to return to **GREEN** between each pod; if the cluster is **YELLOW**, the restart can appear stuck and old pods keep running.
+
+**Force a rolling restart** (after apply, or if pods did not recycle within a few minutes):
+
+```bash
+./deploy/opensearch/rollout-restart.sh
+```
+
+```powershell
+.\deploy\opensearch\rollout-restart.ps1
+```
+
+Or apply and restart in one step:
+
+```bash
+OPENSEARCH_ROLLOUT_RESTART=1 ./deploy/opensearch/apply-cluster.sh
+```
+
+**Verify CORS settings inside a pod:**
+
+```bash
+kubectl exec -n opensearch-bench opensearch-bench-masters-0 -- \
+  grep -E '^http\.cors\.' /usr/share/opensearch/config/opensearch.yml
+```
+
+**Check operator logs** if restart never starts:
+
+```bash
+kubectl logs -n opensearch-operator-system \
+  -l app.kubernetes.io/name=opensearch-operator --tail=100
+```
+
+Look for messages such as `RollingRestart` or `Cluster is not ready for next pod to restart`.
 
 ## Troubleshooting
 
