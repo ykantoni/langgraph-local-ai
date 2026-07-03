@@ -1,0 +1,20 @@
+[
+  {
+    "customer_id": "C001",
+    "name": "Nordic Telecom",
+    "country": "Finland",
+    "tier": "gold"
+  },
+  {
+    "customer_id": "C002",
+    "name": "Baltic Retail",
+    "country": "Estonia",
+    "tier": "silver"
+  },
+  {
+    "customer_id": "C003",
+    "name": "Cloud Logistics",
+    "country": "Sweden",
+    "tier": "gold"
+  }
+]

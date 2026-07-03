@@ -1,0 +1,9 @@
+$env:PGVECTOR_DSN="postgresql://postgres:postgres@172.19.73.182:32369/postgres"
+$env:QDRANT_URL="http://172.19.73.182:31189"
+$env:CHROMA_HOST="172.19.73.182"
+$env:CHROMA_PORT="32086"
+$env:OPENSEARCH_HOST = 172.19.73.182
+$env:OPENSEARCH_PORT = 31218
+$env:OPENSEARCH_USE_SSL = 1
+$env:OPENSEARCH_USER = "admin"
+$env:OPENSEARCH_PASSWORD = "Bench1pass!"

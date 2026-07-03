@@ -32,7 +32,7 @@ def resolve_config(
     default_index: str,
 ) -> dict[str, Any]:
     url = os.environ.get("OPENSEARCH_URL", "").strip()
-    host = os.environ.get("OPENSEARCH_HOST", "127.0.0.1").strip()
+    host = os.environ.get("OPENSEARCH_HOST", "172.19.73.182").strip()
     port = int(os.environ.get("OPENSEARCH_PORT", "9200"))
     use_ssl = _env_bool("OPENSEARCH_USE_SSL")
     user = os.environ.get("OPENSEARCH_USER", "").strip()

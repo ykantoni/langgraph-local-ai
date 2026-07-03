@@ -1,0 +1,83 @@
+# Dejavu — web UI for browsing Elasticsearch / OpenSearch indices.
+#
+# Equivalent to:
+#   docker run -p 1358:1358 -d appbaseio/dejavu
+#
+# Deploy:
+#   kubectl apply -f deploy/dejavu/dejavu.yaml
+#   kubectl wait --for=condition=available deployment/dejavu -n dejavu --timeout=120s
+#   kubectl get svc dejavu -n dejavu
+#
+# port-forward:
+#   kubectl port-forward -n dejavu svc/dejavu 1358:1358
+#   open http://localhost:1358
+#
+# NodePort (if assigned):
+#   kubectl get svc dejavu -n dejavu
+#   open http://<NODE_IP>:<nodePort>
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dejavu
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dejavu
+  namespace: dejavu
+  labels:
+    app: dejavu
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dejavu
+  template:
+    metadata:
+      labels:
+        app: dejavu
+    spec:
+      containers:
+        - name: dejavu
+          image: appbaseio/dejavu
+          ports:
+            - containerPort: 1358
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dejavu
+  namespace: dejavu
+  labels:
+    app: dejavu
+spec:
+  type: NodePort
+  selector:
+    app: dejavu
+  ports:
+    - name: http
+      port: 1358
+      targetPort: http
+      # nodePort omitted — Kubernetes assigns 30000–32767; read with kubectl get svc

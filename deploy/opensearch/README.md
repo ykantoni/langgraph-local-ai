@@ -1,13 +1,14 @@
-# OpenSearch on Kubernetes (Helm, NodePort)
+# OpenSearch on Kubernetes (Operator, NodePort)
 
-Deploy [OpenSearch](https://opensearch.org/) for `benchmark.py` / `benchmark8.py` using the official [`opensearch/opensearch`](https://github.com/opensearch-project/helm-charts) Helm chart. The chart version is resolved from the repo at deploy time (newest unless pinned).
+Deploy [OpenSearch](https://opensearch.org/) for `benchmark.py` / `benchmark8.py` using the official [OpenSearch Kubernetes Operator](https://github.com/opensearch-project/opensearch-k8s-operator). The operator is installed with Helm; the cluster is an `OpenSearchCluster` custom resource.
 
-Single-node cluster, HTTPS with the demo security configuration, and a **NodePort** service named `opensearch-bench` (matches `benchmark_opensearch.py` port-forward defaults).
+HTTPS with operator-generated TLS, **NodePort** on service `opensearch-bench` (matches `benchmark_opensearch.py` port-forward defaults).
 
 ## Prerequisites
 
 - `kubectl` and `helm` on your PATH
-- Cluster with enough memory for one OpenSearch pod (~2–4 GiB)
+- Cluster with enough memory for a **3-node** OpenSearch cluster (~6–9 GiB; operator does not support single-node)
+- **cert-manager is optional** — if not installed, deploy scripts disable operator admission webhooks automatically
 - **Admin password** in the environment (required for OpenSearch 2.12+):
 
   - At least 8 characters
@@ -25,25 +26,45 @@ $env:OPENSEARCH_INITIAL_ADMIN_PASSWORD = "Bench1pass!"
 **Bash (Linux / WSL / cluster jump host):**
 
 ```bash
-export OPENSEARCH_INITIAL_ADMIN_PASSWORD='Bench1pass!'
+export OPENSEARCH_INITIAL_ADMIN_PASSWORD='Bench1pass!' # 123QWEasd#%¤
 chmod +x deploy/opensearch/deploy.sh
 ./deploy/opensearch/deploy.sh
+kubectl -n opensearch-bench expose service opensearch-bench --name=opensearch-external --type=NodePort
 ```
 
-**Pin a specific chart version** (optional):
+The script:
+
+1. Installs the OpenSearch Operator via Helm (latest chart from repo unless pinned)
+2. Creates namespace `opensearch-bench` and admin credentials secret
+3. Applies `OpenSearchCluster` `opensearch-bench` (OpenSearch **3.x** by default)
+4. Waits for pods and patches the service to `NodePort`
+
+**Skip operator install** if it is already cluster-wide:
 
 ```powershell
-$env:OPENSEARCH_CHART_VERSION = "3.1.0"
+$env:OPENSEARCH_SKIP_OPERATOR = "1"
 ```
 
 ```bash
-export OPENSEARCH_CHART_VERSION=3.1.0
+export OPENSEARCH_SKIP_OPERATOR=1
 ```
 
-Wait for the pod to become Ready:
+**Pin versions** (optional):
 
 ```powershell
-kubectl wait --for=condition=ready pod -n opensearch-bench -l app.kubernetes.io/instance=opensearch-bench --timeout=600s
+$env:OPENSEARCH_VERSION = "3.1.0"
+$env:OPENSEARCH_OPERATOR_VERSION = "3.0.3"
+```
+
+```bash
+export OPENSEARCH_VERSION=3.1.0
+export OPENSEARCH_OPERATOR_VERSION=3.0.3
+```
+
+Check readiness and NodePort:
+
+```powershell
+kubectl get pods -n opensearch-bench -l opensearch.org/opensearch-cluster=opensearch-bench
 kubectl get nodes -o wide
 kubectl get svc opensearch-bench -n opensearch-bench
 ```
@@ -61,17 +82,6 @@ $env:OPENSEARCH_USE_SSL = "1"
 python benchmark.py
 ```
 
-Example:
-
-```powershell
-$env:OPENSEARCH_HOST = "172.19.73.182"
-$env:OPENSEARCH_PORT = "31234"
-$env:OPENSEARCH_USER = "admin"
-$env:OPENSEARCH_PASSWORD = "Bench1pass!"
-$env:OPENSEARCH_USE_SSL = "1"
-python benchmark.py
-```
-
 **Port-forward** (localhost):
 
 ```powershell
@@ -85,39 +95,72 @@ python benchmark.py
 
 ## Verify
 
-In-cluster (from the OpenSearch pod):
-
 ```bash
-kubectl exec -n opensearch-bench opensearch-bench-0 -- \
+kubectl exec -n opensearch-bench opensearch-bench-masters-0 -- \
   curl -sk -u "admin:${OPENSEARCH_INITIAL_ADMIN_PASSWORD}" https://localhost:9200
 ```
 
+curl --insecure -XGET -u 'admin:admin' 'https://2.2.60.94:9200/_cat/nodes?v'
+
 ## Tear down
 
+**Cluster only** (operator stays installed):
+
 ```powershell
-helm uninstall opensearch-bench -n opensearch-bench
-kubectl delete namespace opensearch-bench   # optional; removes PVC if reclaim policy allows
+kubectl delete opensearchcluster opensearch-bench -n opensearch-bench
+kubectl delete secret opensearch-bench-admin-credentials -n opensearch-bench
+kubectl delete pvc -l opensearch.org/opensearch-cluster=opensearch-bench -n opensearch-bench
+```
+
+**Operator** (cluster-wide):
+
+```powershell
+helm uninstall opensearch-operator -n opensearch-operator-system
 ```
 
 ## Configuration
 
 | File | Purpose |
 |------|---------|
-| `values.yaml` | Single-node Helm values (NodePort, persistence, JVM heap) |
-| `deploy.ps1` | Windows deploy script; reads `OPENSEARCH_INITIAL_ADMIN_PASSWORD` |
-| `deploy.sh` | Linux deploy script; same env contract |
+| `cluster.yaml` | `OpenSearchCluster` manifest template (`__OPENSEARCH_VERSION__` substituted at deploy) |
+| `operator-values.yaml` | Operator Helm defaults (webhooks off without cert-manager) |
+| `deploy.ps1` | Windows deploy script |
+| `deploy.sh` | Linux deploy script |
+| `install-operator.sh` | Shared operator Helm install |
+| `dashboards/` | Helm Dashboards → external OpenSearch ([`dashboards/README.md`](dashboards/README.md)) |
 
-Edit `values.yaml` to tune:
+For **Dashboards only** (external OpenSearch at `10.1.139.63:9200`), see [`dashboards/README.md`](dashboards/README.md).
 
-- `persistence.storageClass` — e.g. `local-storage` (see `deploy/chroma/chroma.yaml`)
-- `nodeSelector` — pin to node `titan` or your storage node
-- `service.nodePort` — fixed NodePort if your cluster requires it
-- `opensearchJavaOpts` / `resources` — for larger benchmark datasets
+Edit `cluster.yaml` to tune:
 
-The admin password is **never** written to `values.yaml`; only `OPENSEARCH_INITIAL_ADMIN_PASSWORD` at install time.
+- `nodePools[].diskSize` / `resources` / `jvm` — heap and storage
+- `nodePools[].nodeSelector` — pin to node `titan` (see `deploy/chroma/chroma.yaml`)
+- `dashboards.enable: true` — optional Dashboards on the same OpenSearchCluster (or use `dashboards/` Helm chart for external OpenSearch)
+
+The admin password is **never** stored in `cluster.yaml`. It is passed via `OPENSEARCH_INITIAL_ADMIN_PASSWORD` into secret `opensearch-bench-admin-credentials`, referenced by `adminCredentialsSecret` and `OPENSEARCH_INITIAL_ADMIN_PASSWORD` on node pods.
+
+## Troubleshooting
+
+**`no matches for kind "Certificate" in version "cert-manager.io/v1"`**
+
+The operator chart defaults to cert-manager for webhook TLS. Re-run deploy with the updated script (it disables webhooks when cert-manager is absent), or install cert-manager first.
+
+If a failed install left a partial release:
+
+```bash
+helm uninstall opensearch-operator -n opensearch-operator-system
+./deploy/opensearch/deploy.sh
+```
+
+Force webhooks on only when cert-manager is installed:
+
+```bash
+export OPENSEARCH_OPERATOR_WEBHOOKS=1
+```
 
 ## Notes
 
-- Default chart deploys OpenSearch **3.x** when using the current `opensearch` Helm repo (`main` branch).
+- Operator minimum: **3** nodes with `cluster_manager` role (no single-node).
+- Default `OPENSEARCH_VERSION=3` tracks the latest OpenSearch 3.x image tag.
 - k-NN is included in the official image; benchmarks create HNSW indices via the REST API.
-- Lab use only: demo TLS certificates and security config. For production, supply custom `securityConfig` and disable demo settings.
+- Lab use only: operator-generated demo TLS. For production, supply custom `securityConfig` and certificates.

@@ -1,0 +1,57 @@
+# OpenSearchCluster for benchmark.py / benchmark8.py (managed by opensearch-k8s-operator).
+#
+# Apply via deploy.sh / deploy.ps1 (creates admin secret and patches NodePort first).
+# Requires the operator: helm install opensearch-operator opensearch-operator/opensearch-operator
+#
+# Operator requires >= 3 nodes with cluster_manager role (no single-node clusters).
+
+apiVersion: opensearch.org/v1
+kind: OpenSearchCluster
+metadata:
+  name: opensearch-bench
+  namespace: opensearch-bench
+spec:
+  general:
+    serviceName: opensearch-bench
+    version: "__OPENSEARCH_VERSION__"
+    vendor: opensearch
+    httpPort: 9200
+    setVMMaxMapCount: true
+    drainDataNodes: true
+    additionalConfig:
+      cluster.routing.allocation.disk.watermark.low: "95%"
+      cluster.routing.allocation.disk.watermark.high: "97%"
+      cluster.routing.allocation.disk.watermark.flood_stage: "99%"
+  dashboards:
+    enable: false
+  security:
+    config:
+      adminCredentialsSecret:
+        name: opensearch-bench-admin-credentials
+    tls:
+      http:
+        generate: true
+      transport:
+        generate: true
+        perNode: true
+  nodePools:
+    - component: masters
+      replicas: 3
+      diskSize: 20Gi
+      roles:
+        - cluster_manager
+        - data
+      jvm: "-Xmx1g -Xms1g"
+      resources:
+        requests:
+          memory: "2Gi"
+          cpu: "500m"
+        limits:
+          memory: "3Gi"
+          cpu: "1000m"
+      env:
+        - name: OPENSEARCH_INITIAL_ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: opensearch-bench-admin-credentials
+              key: password

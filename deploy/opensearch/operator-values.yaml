@@ -1,0 +1,9 @@
+# Helm values for opensearch-operator/opensearch-operator (benchmark lab defaults).
+#
+# deploy.sh / deploy.ps1 auto-enable webhooks when cert-manager is present.
+# Without cert-manager, webhooks stay disabled so Certificate/Issuer CRDs are not required.
+
+webhook:
+  enabled: false
+  certManager:
+    enabled: false

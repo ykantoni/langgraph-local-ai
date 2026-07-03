@@ -1,0 +1,30 @@
+[
+  {
+    "order_id": "O1001",
+    "customer_id": "C001",
+    "order_date": "2026-06-01",
+    "status": "paid",
+    "total_amount": 1200.50
+  },
+  {
+    "order_id": "O1002",
+    "customer_id": "C001",
+    "order_date": "2026-06-05",
+    "status": "shipped",
+    "total_amount": 340.00
+  },
+  {
+    "order_id": "O1003",
+    "customer_id": "C002",
+    "order_date": "2026-06-08",
+    "status": "cancelled",
+    "total_amount": 80.00
+  },
+  {
+    "order_id": "O1004",
+    "customer_id": "C003",
+    "order_date": "2026-06-10",
+    "status": "paid",
+    "total_amount": 2150.75
+  }
+]
