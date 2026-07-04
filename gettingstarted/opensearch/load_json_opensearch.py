@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Load a JSON file into OpenSearch. Index name = file stem; mappings inferred from values."""
+"""Load JSON into OpenSearch. Single file or join two files and embed lookup records."""
 
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ ISO_DATE_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?$"
 )
 INDEX_NAME_RE = re.compile(r"[^a-z0-9._-]+")
-
 
 def setup_logging(level: str) -> None:
     logging.basicConfig(
@@ -113,6 +112,78 @@ def load_records(path: Path) -> list[dict[str, Any]]:
     raise ValueError("JSON root must be an object or an array of objects")
 
 
+def _join_key(value: Any) -> str:
+    return str(value)
+
+
+def join_records(
+    base_records: list[dict[str, Any]],
+    lookup_records: list[dict[str, Any]],
+    *,
+    join_on: str,
+    embed_as: str,
+) -> list[dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    duplicate_keys = 0
+    skipped_lookup = 0
+
+    for record in lookup_records:
+        key_value = record.get(join_on)
+        if key_value is None:
+            skipped_lookup += 1
+            continue
+        norm_key = _join_key(key_value)
+        if norm_key in lookup:
+            duplicate_keys += 1
+        lookup[norm_key] = record
+
+    if duplicate_keys:
+        logger.warning(
+            "join_records: %d duplicate %r keys in lookup file; last record wins",
+            duplicate_keys,
+            join_on,
+        )
+    if skipped_lookup:
+        logger.warning(
+            "join_records: skipped %d lookup records with missing %r",
+            skipped_lookup,
+            join_on,
+        )
+
+    joined: list[dict[str, Any]] = []
+    missing_matches = 0
+    missing_keys = 0
+    embedded_count = 0
+
+    for record in base_records:
+        doc = dict(record)
+        key_value = record.get(join_on)
+        if key_value is None:
+            missing_keys += 1
+            joined.append(doc)
+            continue
+
+        match = lookup.get(_join_key(key_value))
+        if match is None:
+            missing_matches += 1
+            joined.append(doc)
+            continue
+
+        doc[embed_as] = dict(match)
+        embedded_count += 1
+        joined.append(doc)
+
+    logger.info(
+        "join_records: base=%d lookup=%d embedded=%d missing_match=%d missing_key=%d",
+        len(base_records),
+        len(lookup_records),
+        embedded_count,
+        missing_matches,
+        missing_keys,
+    )
+    return joined
+
+
 def _looks_like_date(value: str) -> bool:
     return bool(ISO_DATE_RE.match(value.strip()))
 
@@ -170,38 +241,64 @@ def _string_mapping(values: list[str]) -> dict[str, str]:
     return {"type": "keyword"}
 
 
+def _mapping_for_merged_kind(merged: str, string_samples: list[str]) -> dict[str, Any]:
+    if merged == "boolean":
+        return {"type": "boolean"}
+    if merged == "long":
+        return {"type": "long"}
+    if merged == "double":
+        return {"type": "double"}
+    if merged == "date":
+        return {"type": "date"}
+    if merged == "keyword":
+        return {"type": "keyword"}
+    return _string_mapping(string_samples)
+
+
+def _infer_field_mapping(values: list[Any]) -> dict[str, Any]:
+    non_null = [value for value in values if value is not None]
+    if not non_null:
+        return {"type": "keyword"}
+
+    dict_values = [value for value in non_null if isinstance(value, dict)]
+    kinds: set[str] = set()
+    string_samples: list[str] = []
+
+    for value in non_null:
+        if isinstance(value, dict):
+            kinds.add("object")
+            continue
+        kind = _value_kind(value)
+        if kind is None:
+            continue
+        kinds.add(kind)
+        if kind == "string" and isinstance(value, str):
+            string_samples.append(value)
+
+    merged = _merge_kinds(kinds)
+    if merged == "object" and dict_values:
+        return {
+            "type": "object",
+            "properties": _infer_properties(dict_values),
+        }
+
+    return _mapping_for_merged_kind(merged, string_samples)
+
+
+def _infer_properties(objects: list[dict[str, Any]]) -> dict[str, Any]:
+    field_values: dict[str, list[Any]] = {}
+    for obj in objects:
+        for key, value in obj.items():
+            field_values.setdefault(key, []).append(value)
+
+    return {
+        key: _infer_field_mapping(values)
+        for key, values in field_values.items()
+    }
+
+
 def infer_mappings(records: list[dict[str, Any]]) -> dict[str, Any]:
-    field_kinds: dict[str, set[str]] = {}
-    string_samples: dict[str, list[str]] = {}
-
-    for record in records:
-        for key, value in record.items():
-            kind = _value_kind(value)
-            if kind is None:
-                continue
-            field_kinds.setdefault(key, set()).add(kind)
-            if kind == "string" and isinstance(value, str):
-                string_samples.setdefault(key, []).append(value)
-
-    properties: dict[str, Any] = {}
-    for key, kinds in field_kinds.items():
-        merged = _merge_kinds(kinds)
-        if merged == "boolean":
-            properties[key] = {"type": "boolean"}
-        elif merged == "long":
-            properties[key] = {"type": "long"}
-        elif merged == "double":
-            properties[key] = {"type": "double"}
-        elif merged == "date":
-            properties[key] = {"type": "date"}
-        elif merged == "object":
-            properties[key] = {"type": "object", "enabled": True}
-        elif merged == "keyword":
-            properties[key] = {"type": "keyword"}
-        else:
-            properties[key] = _string_mapping(string_samples.get(key, []))
-
-    return {"properties": properties}
+    return {"properties": _infer_properties(records)}
 
 
 def create_index(
@@ -262,11 +359,29 @@ def bulk_index(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Load a JSON file into OpenSearch with inferred mappings."
+        description="Load JSON into OpenSearch with inferred mappings."
     )
-    parser.add_argument("json_file", type=Path, help="Path to a JSON file")
-    parser.add_argument("--index", help="Override index name (default: file stem)")
+    parser.add_argument("json_file", type=Path, help="Primary JSON file (base records)")
+    parser.add_argument(
+        "--index",
+        help="Target index name (required with --join-file; default: primary file stem)",
+    )
     parser.add_argument("--delete-index", action="store_true")
+
+    join_group = parser.add_argument_group("join and embed")
+    join_group.add_argument(
+        "--join-file",
+        type=Path,
+        help="Secondary JSON file whose records are embedded into base records",
+    )
+    join_group.add_argument(
+        "--join-on",
+        help="Field name used to join base and lookup records (e.g. customer_id)",
+    )
+    join_group.add_argument(
+        "--embed-as",
+        help="Nested field name for embedded lookup record (default: join file stem)",
+    )
 
     parser.add_argument("--url", default=os.getenv("OPENSEARCH_URL", ""))
     parser.add_argument("--host", default=os.getenv("OPENSEARCH_HOST"))
@@ -294,20 +409,55 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    setup_logging(args.log_level)
-
+def resolve_records(args: argparse.Namespace) -> tuple[list[dict[str, Any]], str]:
     json_path = args.json_file.resolve()
     if not json_path.is_file():
         raise SystemExit(f"File not found: {json_path}")
 
-    logger.info("main: loading json_file=%s", json_path)
+    logger.info("resolve_records: loading base json_file=%s", json_path)
     records = load_records(json_path)
     if not records:
-        raise SystemExit("JSON file contains no records")
+        raise SystemExit("Primary JSON file contains no records")
 
-    index_name = args.index or index_name_from_file(json_path)
+    if args.join_file:
+        if not args.join_on:
+            raise SystemExit("--join-on is required when --join-file is set")
+        if not args.index:
+            raise SystemExit("--index is required when --join-file is set")
+
+        join_path = args.join_file.resolve()
+        if not join_path.is_file():
+            raise SystemExit(f"Join file not found: {join_path}")
+
+        embed_as = args.embed_as or index_name_from_file(join_path)
+        logger.info(
+            "resolve_records: joining join_file=%s join_on=%r embed_as=%r",
+            join_path,
+            args.join_on,
+            embed_as,
+        )
+        lookup_records = load_records(join_path)
+        if not lookup_records:
+            raise SystemExit("Join JSON file contains no records")
+
+        records = join_records(
+            records,
+            lookup_records,
+            join_on=args.join_on,
+            embed_as=embed_as,
+        )
+        index_name = args.index
+    else:
+        index_name = args.index or index_name_from_file(json_path)
+
+    return records, index_name
+
+
+def main() -> None:
+    args = parse_args()
+    setup_logging(args.log_level)
+
+    records, index_name = resolve_records(args)
     mappings = infer_mappings(records)
     logger.debug("main: inferred mappings=%s", mappings)
 
