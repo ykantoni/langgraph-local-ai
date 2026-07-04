@@ -235,10 +235,22 @@ def _merge_kinds(kinds: set[str]) -> str:
     return "keyword"
 
 
-def _string_mapping(values: list[str]) -> dict[str, str]:
+def _text_keyword_mapping(*, ignore_above: int = 256) -> dict[str, Any]:
+    return {
+        "type": "text",
+        "fields": {
+            "keyword": {
+                "type": "keyword",
+                "ignore_above": ignore_above,
+            },
+        },
+    }
+
+
+def _string_mapping(values: list[str]) -> dict[str, Any]:
     if any(len(value) > 256 for value in values):
-        return {"type": "text"}
-    return {"type": "keyword"}
+        return _text_keyword_mapping(ignore_above=256)
+    return _text_keyword_mapping()
 
 
 def _mapping_for_merged_kind(merged: str, string_samples: list[str]) -> dict[str, Any]:
@@ -251,14 +263,14 @@ def _mapping_for_merged_kind(merged: str, string_samples: list[str]) -> dict[str
     if merged == "date":
         return {"type": "date"}
     if merged == "keyword":
-        return {"type": "keyword"}
+        return _text_keyword_mapping()
     return _string_mapping(string_samples)
 
 
 def _infer_field_mapping(values: list[Any]) -> dict[str, Any]:
     non_null = [value for value in values if value is not None]
     if not non_null:
-        return {"type": "keyword"}
+        return _text_keyword_mapping()
 
     dict_values = [value for value in non_null if isinstance(value, dict)]
     kinds: set[str] = set()

@@ -43,7 +43,7 @@ Example `users.json`:
 ]
 ```
 
-This file would create index `users` with inferred types such as `id: long`, `name: keyword`, `active: boolean`, `score: double`, `created_at: date`.
+This file would create index `users` with inferred types such as `id: long`, `name: text` (+ `.keyword` subfield), `active: boolean`, `score: double`, `created_at: date`.
 
 ### Connection settings
 
@@ -187,8 +187,18 @@ Nested embedded objects get the same typed mappings as top-level fields — not 
     "type": "object",
     "properties": {
       "customer_id": { "type": "long" },
-      "name": { "type": "keyword" },
-      "tier": { "type": "keyword" },
+      "name": {
+        "type": "text",
+        "fields": {
+          "keyword": { "type": "keyword", "ignore_above": 256 }
+        }
+      },
+      "tier": {
+        "type": "text",
+        "fields": {
+          "keyword": { "type": "keyword", "ignore_above": 256 }
+        }
+      },
       "active": { "type": "boolean" }
     }
   }
@@ -220,11 +230,11 @@ The script scans all records (including nested embedded objects) and infers Open
 | integer | `long` |
 | float, or mixed int/float | `double` |
 | ISO date string (`2024-01-15`, `2024-01-15T10:00:00Z`, etc.) | `date` |
-| short string (≤ 256 chars) | `keyword` |
-| long string (> 256 chars) | `text` |
+| short string (≤ 256 chars) | `text` with `fields.keyword` (`keyword`) |
+| long string (> 256 chars) | `text` with `fields.keyword` (`keyword`, `ignore_above: 256`) |
 | nested object | `object` with typed `properties` |
-| array | typed by contents, or `keyword` if mixed |
-| mixed or incompatible scalar types | `keyword` |
+| array | typed by contents, or `text` + `keyword` subfield if mixed |
+| mixed or incompatible scalar types | `text` with `fields.keyword` (`keyword`) |
 
 `null` values are ignored during inference. If a field is only `null` across all records, it may be omitted from the mapping.
 
