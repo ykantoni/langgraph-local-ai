@@ -290,7 +290,7 @@ def _infer_field_mapping(values: list[Any]) -> dict[str, Any]:
     merged = _merge_kinds(kinds)
     if merged == "object" and dict_values:
         return {
-            "type": "object",
+            "type": "nested",
             "properties": _infer_properties(dict_values),
         }
 
