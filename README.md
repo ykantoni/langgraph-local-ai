@@ -99,6 +99,13 @@ $env:MCP_SERVERS_JSON='{"local-docs": {"transport": "streamable_http", "url": "h
 python -m local_agent.server
 ```
 
+# cmd
+```
+set MCP_ENABLED=1
+set "MCP_SERVERS_JSON={"local-docs":{"transport":"streamable_http","url":"http://127.0.0.1:8765/mcp"}}"
+python -m local_agent.server
+```
+
 Note the MCP server binds **port 8765** by default — different from the
 agent's FastAPI port (8000). Override with `MCP_HTTP_HOST` / `MCP_HTTP_PORT`
 on the MCP server, and update the URL in `MCP_SERVERS_JSON` to match.

@@ -183,9 +183,9 @@ Nested embedded objects get the same typed mappings as top-level fields — not 
 
 ```json
 {
-  "customer": {
-    "type": "object",
-    "properties": {
+    "customer": {
+      "type": "nested",
+      "properties": {
       "customer_id": { "type": "long" },
       "name": {
         "type": "text",
@@ -232,7 +232,7 @@ The script scans all records (including nested embedded objects) and infers Open
 | ISO date string (`2024-01-15`, `2024-01-15T10:00:00Z`, etc.) | `date` |
 | short string (≤ 256 chars) | `text` with `fields.keyword` (`keyword`) |
 | long string (> 256 chars) | `text` with `fields.keyword` (`keyword`, `ignore_above: 256`) |
-| nested object | `object` with typed `properties` |
+| nested object | `nested` with typed `properties` |
 | array | typed by contents, or `text` + `keyword` subfield if mixed |
 | mixed or incompatible scalar types | `text` with `fields.keyword` (`keyword`) |
 

@@ -1,0 +1,9 @@
+﻿python gettingstarted/opensearch/load_json_opensearch.py gettingstarted/data/orders.json `
+  --join-file gettingstarted/data/customers.json `
+  --join-on customer_id `
+  --embed-as customer `
+  --index orders_enriched
+
+search-heavy workload: 10–30 GB per primary shard
+log/write-heavy workload: 30–50 GB per primary shard
+avoid going much above ~50 GB per shard

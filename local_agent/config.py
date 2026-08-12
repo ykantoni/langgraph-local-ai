@@ -1,7 +1,6 @@
 import os
 from dataclasses import dataclass
 
-
 @dataclass(frozen=True)
 class Settings:
     log_level: str
@@ -42,10 +41,12 @@ class Settings:
 
 
 def load_settings() -> Settings:
-    return Settings(
+    env_base_url = os.environ.get("OLLAMA_BASE_URL")
+    env_chat_model = os.environ.get("OLLAMA_CHAT_MODEL")
+    settings = Settings(
         log_level=os.environ.get("LOG_LEVEL", "INFO"),
-        ollama_base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
-        ollama_chat_model=os.environ.get("OLLAMA_CHAT_MODEL", "granite3.3"),
+        ollama_base_url=env_base_url or "http://192.168.1.15:11434",
+        ollama_chat_model=env_chat_model or "gemma4:12b",
         st_embed_model=os.environ.get("ST_EMBED_MODEL", "sentence-transformers/static-retrieval-mrl-en-v1"),
         st_encode_batch=int(os.environ.get("ST_ENCODE_BATCH", "32")),
         st_device=os.environ.get("ST_DEVICE", "cpu"),
@@ -67,4 +68,4 @@ def load_settings() -> Settings:
         mcp_servers_json=os.environ.get("MCP_SERVERS_JSON", ""),
         mcp_tool_search_name=os.environ.get("MCP_TOOL_SEARCH_NAME", "search_docs"),
     )
-
+    return settings

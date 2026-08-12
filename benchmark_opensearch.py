@@ -6,18 +6,22 @@ import os
 import subprocess
 import threading
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import numpy as np
 
-try:
+if TYPE_CHECKING:
     from opensearchpy import OpenSearch, helpers
+else:
+    try:
+        from opensearchpy import OpenSearch, helpers
 
-    OPENSEARCH_AVAILABLE = True
-except ImportError:
-    OPENSEARCH_AVAILABLE = False
-    OpenSearch = Any  # type: ignore[misc, assignment]
+        OPENSEARCH_AVAILABLE = True
+    except ImportError:
+        OPENSEARCH_AVAILABLE = False
+        OpenSearch = Any  # type: ignore[misc, assignment]
+        helpers = Any  # type: ignore[misc, assignment]
 
 _pf_proc: subprocess.Popen | None = None
 _bulk_semaphore: threading.Semaphore | None = None

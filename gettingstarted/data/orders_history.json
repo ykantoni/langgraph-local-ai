@@ -1,0 +1,63 @@
+[
+  {
+    "customer_id": "C001",
+    "name": "Nordic Telecom",
+    "country": "Finland",
+    "tier": "gold",
+    "order_to_customer": "customer"
+  },
+  {
+    "customer_id": "C002",
+    "name": "Baltic Retail",
+    "country": "Estonia",
+    "tier": "silver",
+    "order_to_customer": "customer"    
+  },
+  {
+    "customer_id": "C003",
+    "name": "Cloud Logistics",
+    "country": "Sweden",
+    "tier": "gold",
+    "order_to_customer": "customer"
+  },
+  {
+    "order_id": "O1001",
+    "customer": {
+      "name": "order", 
+      "parent": "0" 
+    }    
+    "order_date": "2026-06-01",
+    "status": "paid",
+    "total_amount": 1200.50
+  },
+  {
+    "order_id": "O1002",
+    "customer": {
+      "name": "order", 
+      "parent": "0" 
+    } 
+    "order_date": "2026-06-05",
+    "status": "shipped",
+    "total_amount": 340.00
+  },
+  {
+    "order_id": "O1003",
+    "customer": {
+      "name": "order", 
+      "parent": "1" 
+    },
+    "order_date": "2026-06-08",
+    "status": "cancelled",
+    "total_amount": 80.00
+  },
+  {
+    "order_id": "O1004",
+    "customer": {
+      "name": "order", 
+      "parent": "2" 
+    } 
+    "order_date": "2026-06-10",
+    "status": "paid",
+    "total_amount": 2150.75
+  }  
+]
