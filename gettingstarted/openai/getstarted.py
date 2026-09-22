@@ -1,8 +1,9 @@
 import os
 from openai import OpenAI
 
-# $env:HF_TOKEN="<REDACTED_OPENAI_API_KEY>"
-# 
+# Set HF_TOKEN in your environment before running, e.g.:
+#   PowerShell: $env:HF_TOKEN="hf_..."
+#   cmd:        set HF_TOKEN=hf_...
 
 client = OpenAI(
     base_url="https://router.huggingface.co/v1",

@@ -42,7 +42,7 @@ def _find_tool(tools: Iterable[BaseTool], name: str) -> BaseTool | None:
     for t in tools:
         if t.name == target:
             return t
-    # Best-effort match by suffix to tolerate "<server>_search_docs" prefixing.
+    # Best-effort match by suffix to tolerate MCP server name prefixes.
     for t in tools:
         if t.name.endswith("_" + target) or t.name.endswith(target):
             return t
@@ -237,6 +237,7 @@ def create_chat_agent(
             f"project documents: {tool_names}.\n\n"
             "Decide which single tool to call and invoke it with the most "
             "appropriate search query for the user's question. "
+            "Prefer query_documents when available. "
             "Do not answer directly; only call the tool.\n\n"
             f"User question / refined query:\n{q}"
         )

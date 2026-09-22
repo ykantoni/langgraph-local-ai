@@ -41,7 +41,7 @@ def _minimal_settings(**overrides) -> Settings:
         force_rebuild_index=False,
         mcp_enabled=False,
         mcp_servers_json="",
-        mcp_tool_search_name="search_docs",
+        mcp_tool_search_name="query_documents",
     )
     base.update(overrides)
     return Settings(**base)
@@ -315,7 +315,7 @@ class TestRuntime(unittest.TestCase):
         settings = _minimal_settings(mcp_enabled=True, mcp_servers_json='{"x":{}}')
         mock_load_settings.return_value = settings
         tool_a = MagicMock()
-        tool_a.name = "search_docs"
+        tool_a.name = "query_documents"
         mock_load_mcp.return_value = [tool_a]
         mock_supports.return_value = True
 
@@ -347,7 +347,7 @@ class TestRuntime(unittest.TestCase):
             mcp_servers_json='{"docs": {"command": "x", "args": [], "transport": "stdio"}}',
         )
         fake_tool = MagicMock()
-        fake_tool.name = "search_docs"
+        fake_tool.name = "query_documents"
         fake_client = MagicMock()
 
         async def _get_tools():

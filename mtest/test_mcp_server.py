@@ -1,63 +1,67 @@
-"""Tests for the FastMCP-based local document search server."""
+"""Tests for the mcp-local-rag launcher (supergateway + streamable HTTP)."""
 
 from __future__ import annotations
 
-import asyncio
+import os
 import unittest
 from unittest.mock import MagicMock, patch
-
-from langchain_core.documents import Document
 
 from local_agent import mcp_server
 
 
-class TestBuildMcpServer(unittest.TestCase):
-    def setUp(self) -> None:
-        # Each test gets a fresh module-level cache.
-        mcp_server._vectorstore = None
-        mcp_server._settings = None
+class TestMcpLocalRagLauncher(unittest.TestCase):
+    def test_build_local_rag_env_maps_docs_and_index_paths(self) -> None:
+        settings = MagicMock()
+        settings.docs_dir = "./docs"
+        settings.faiss_index_dir = "./faiss_index"
 
-    def tearDown(self) -> None:
-        mcp_server._vectorstore = None
-        mcp_server._settings = None
+        with patch.dict(os.environ, {}, clear=False):
+            env = mcp_server.build_local_rag_env(settings)
 
-    def _get_search_tool(self):
-        server = mcp_server.build_mcp_server(name="local-docs-test")
-        tools = asyncio.run(server.list_tools())
-        names = [t.name for t in tools]
-        self.assertIn("search_docs", names)
-        return server, next(t for t in tools if t.name == "search_docs")
+        self.assertEqual(env["BASE_DIR"], os.path.abspath("./docs"))
+        self.assertTrue(env["DB_PATH"].endswith(os.path.join("mcp_local_rag", "lancedb")))
+        self.assertTrue(env["CACHE_DIR"].endswith(os.path.join("mcp_local_rag", "models")))
 
-    def test_search_docs_tool_is_registered(self) -> None:
-        server, tool = self._get_search_tool()
-        self.assertEqual(tool.name, "search_docs")
-        # The docstring becomes the tool description.
-        self.assertIn("local FAISS", (tool.description or ""))
-        self.assertIsNotNone(server)
+    def test_build_streamable_http_command_uses_supergateway(self) -> None:
+        cmd = mcp_server.build_streamable_http_command(
+            port=8765,
+            path="/mcp",
+            stdio_command="npx -y mcp-local-rag",
+            stateful=True,
+            session_timeout_ms=60000,
+        )
+        self.assertTrue(cmd[0].lower().endswith("npx") or cmd[0].lower().endswith("npx.cmd"))
+        self.assertIn("supergateway", cmd)
+        self.assertIn("--outputTransport", cmd)
+        self.assertIn("streamableHttp", cmd)
+        self.assertIn("--port", cmd)
+        self.assertIn("8765", cmd)
+        self.assertIn("--streamableHttpPath", cmd)
+        self.assertIn("/mcp", cmd)
+        self.assertIn("--stateful", cmd)
+        self.assertIn("--sessionTimeout", cmd)
+        self.assertIn("60000", cmd)
 
-    def test_search_docs_invokes_vectorstore_lazily(self) -> None:
-        fake_vs = MagicMock()
-        fake_vs.similarity_search.return_value = [
-            Document(page_content="alpha", metadata={}),
-            Document(page_content="beta", metadata={}),
-        ]
+    def test_main_runs_sync_then_streamable_http(self) -> None:
+        settings = MagicMock()
+        settings.docs_dir = "./docs"
+        settings.faiss_index_dir = "./faiss_index"
 
-        with patch.object(mcp_server, "_get_vectorstore", return_value=fake_vs):
-            server = mcp_server.build_mcp_server(name="local-docs-test")
-            result = asyncio.run(
-                server.call_tool("search_docs", {"query": "hello", "k": 2})
-            )
+        with (
+            patch.object(mcp_server, "load_settings", return_value=settings),
+            patch.object(mcp_server, "_require_npx"),
+            patch.object(mcp_server, "run_sync", return_value=0) as sync_mock,
+            patch.object(mcp_server, "run_streamable_http", return_value=0) as http_mock,
+            patch.dict(
+                os.environ,
+                {"MCP_TRANSPORT": "streamable-http", "MCP_AUTO_SYNC": "1"},
+                clear=False,
+            ),
+        ):
+            mcp_server.main()
 
-        fake_vs.similarity_search.assert_called_once_with("hello", k=2)
-        # FastMCP returns (content_blocks, structured) for call_tool.
-        if isinstance(result, tuple):
-            content_blocks = result[0]
-        else:
-            content_blocks = result
-        text_parts = [getattr(b, "text", "") for b in content_blocks]
-        joined = "\n".join(text_parts)
-        self.assertIn("alpha", joined)
-        self.assertIn("beta", joined)
+        sync_mock.assert_called_once()
+        http_mock.assert_called_once()
 
 
 if __name__ == "__main__":

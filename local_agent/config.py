@@ -66,6 +66,6 @@ def load_settings() -> Settings:
         force_rebuild_index=os.environ.get("FORCE_REBUILD_INDEX", "0") == "1",
         mcp_enabled=os.environ.get("MCP_ENABLED", "0") == "1",
         mcp_servers_json=os.environ.get("MCP_SERVERS_JSON", ""),
-        mcp_tool_search_name=os.environ.get("MCP_TOOL_SEARCH_NAME", "search_docs"),
+        mcp_tool_search_name=os.environ.get("MCP_TOOL_SEARCH_NAME", "query_documents"),
     )
     return settings

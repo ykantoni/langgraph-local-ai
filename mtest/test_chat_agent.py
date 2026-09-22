@@ -35,7 +35,7 @@ class SmokeTest(unittest.TestCase):
             force_rebuild_index=False,
             mcp_enabled=False,
             mcp_servers_json="",
-            mcp_tool_search_name="search_docs",
+            mcp_tool_search_name="query_documents",
         )
 
     def test_cli_main_wires_components_and_exits_without_running_agent(self) -> None:
@@ -116,7 +116,7 @@ class SmokeTest(unittest.TestCase):
         ]
 
         mcp_tool = MagicMock()
-        mcp_tool.name = "search_docs"
+        mcp_tool.name = "query_documents"
         mcp_tool.invoke.return_value = "MCP TOOL RESULT"
 
         llm_instance = MagicMock()
@@ -140,7 +140,7 @@ class SmokeTest(unittest.TestCase):
         bound_llm.invoke.return_value = AIMessage(
             content="",
             tool_calls=[
-                {"id": "1", "name": "search_docs", "args": {"query": "hello"}},
+                {"id": "1", "name": "query_documents", "args": {"query": "hello"}},
             ],
         )
 
@@ -171,7 +171,7 @@ class SmokeTest(unittest.TestCase):
         ]
 
         mcp_tool = MagicMock()
-        mcp_tool.name = "search_docs"
+        mcp_tool.name = "query_documents"
 
         llm_instance = MagicMock()
         llm_instance.bind_tools.side_effect = NotImplementedError("no tools")
